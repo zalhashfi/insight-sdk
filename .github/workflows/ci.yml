@@ -27,7 +27,12 @@ jobs:
         run: pip install platformio
 
       - name: Run native tests
-        run: pio test -e native
+        run: |
+          set -o pipefail
+          pio test -e native 2>&1 | tee /tmp/pio.log
+          # Guard against false pass: `pio test -f <missing suite>` exits 0 with
+          # "0 test cases: 0 succeeded". Require at least one executed test.
+          grep -qE '[1-9][0-9]* test cases: [1-9][0-9]* succeeded' /tmp/pio.log
 
       - name: Build Blink for ESP32
         run: pio ci --board esp32dev --lib . examples/Blink
