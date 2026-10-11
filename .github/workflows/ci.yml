@@ -5,7 +5,7 @@ on:
   pull_request:
 
 jobs:
-  ci:
+  native:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,8 +34,43 @@ jobs:
           # "0 test cases: 0 succeeded". Require at least one executed test.
           grep -qE '[1-9][0-9]* test cases: [1-9][0-9]* succeeded' /tmp/pio.log
 
-      - name: Build Blink for ESP32
-        run: pio ci --board esp32dev --lib . examples/Blink
+  # Compile every shipped example for BOTH ESP targets. Examples are ordinary
+  # Arduino sketches, so `pio ci` is the compile gate; a matrix keeps the four
+  # sketches x two boards explicit and independently reportable.
+  examples:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [esp32dev, nodemcuv2]
+        example:
+          - path: examples/Blink
+            name: Blink
+          - path: src/examples/SensorTelemetry
+            name: SensorTelemetry
+          - path: src/examples/OtaUpdate
+            name: OtaUpdate
+          - path: src/examples/ControlAck
+            name: ControlAck
+    name: ${{ matrix.example.name }} (${{ matrix.board }})
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Build Blink for ESP8266
-        run: pio ci --board nodemcuv2 --lib . examples/Blink
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build ${{ matrix.example.name }} for ${{ matrix.board }}
+        run: pio ci --board ${{ matrix.board }} --lib . ${{ matrix.example.path }}
