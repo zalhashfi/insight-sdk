@@ -40,9 +40,8 @@ class InsightTransport {
   // POST `json` to `path`. Reports the outcome of the attempt.
   virtual HttpOutcome postJson(const char* path, const char* json) = 0;
 
-  // GET `path` into `buffer` of `bufferLen` bytes (null-terminated on
-  // success). Reports the outcome of the attempt; `buffer` is only filled
-  // on a response.
+  // GET `path` into `buffer` of `bufferLen` bytes. Reports the outcome of the
+  // attempt; `buffer` is only filled on a response.
   //
   // `contentLength`, when non-null, receives the number of BODY bytes the
   // response delivered, independent of any NUL terminator. A TEXT body (for
@@ -50,6 +49,13 @@ class InsightTransport {
   // a firmware image — may contain NUL bytes and MUST be measured with this
   // count, which is exactly why the seam exposes it. On a non-OK outcome the
   // count is left at 0.
+  //
+  // The buffer is filled with AT MOST `bufferLen` body bytes and is NOT
+  // null-terminated when the body may fill it (an opaque image can be exactly
+  // `bufferLen` bytes). An adapter that serves a text body and wants
+  // null-termination MUST terminate it itself, keeping one byte spare; a caller
+  // that parses text (e.g. the JSON offer) MUST provide a zeroed buffer and
+  // rely on `contentLength`, as {@link InsightOta} does.
   virtual HttpOutcome get(const char* path, char* buffer, size_t bufferLen,
                           size_t* contentLength = 0) = 0;
 };

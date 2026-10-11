@@ -318,10 +318,13 @@ class InsightOtaRunner {
     return readClock() - trialStartMs_;
   }
 
-  // How many times each seam was called, over the runner's lifetime. `markValid`
-  // is capped at one per successful confirm of a distinct trial, and `rollback`
-  // at one per ESP32 expiry — both counters exist so the tests can prove the
-  // "exactly once / never" properties instead of asserting them.
+  // How many times each seam was called, over the runner's lifetime.
+  // `markValid` is invoked at most once per confirm() call on a pending trial —
+  // a FAILED attempt still counts (confirm() then returns false and the runner
+  // stays in Trial), so this counts INVOCATIONS, not successful marks; success
+  // is reported by confirm()'s return value. `rollback` is invoked at most once
+  // per ESP32 expiry. Both counters exist so the tests can prove the "exactly
+  // once / never" properties instead of asserting them.
   unsigned long markValidCalls() const { return markValidCalls_; }
   unsigned long rollbackCalls() const { return rollbackCalls_; }
 
