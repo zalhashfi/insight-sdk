@@ -221,13 +221,17 @@ class InsightOtaRunner {
     if (state_ != Trial) {
       return false;
     }
-    bool ok = true;
     if (markValid_ != 0) {
-      ok = markValid_();
       ++markValidCalls_;
+      if (!markValid_()) {
+        // The flag was NOT set: stay in `Trial` so the caller can retry and so
+        // no observer sees `confirmed` for a trial that was not actually
+        // marked — the invariant this method documents.
+        return false;
+      }
     }
     state_ = Confirmed;
-    return ok;
+    return true;
   }
 
   // --- phase 2, second outcome: expiry, via poll ------------------------

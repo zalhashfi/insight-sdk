@@ -122,15 +122,20 @@ class HttpClientTransport : public insight::InsightTransport {
     }
     if (status >= 200 && status < 300) {
       // OPAQUE bodies (the image may contain NULs) must be read by length, not
-      // by strlen; the seam's contentLength is what makes that possible.
+      // by strlen; the seam's contentLength is what makes that possible. This
+      // adapter serves BOTH the JSON offer body and the binary image, and the
+      // caller demands an EXACT size for the image (a short read is a
+      // SizeMismatch) — so the full `bufferLen` capacity is used and NO NUL
+      // terminator is appended: reserving a byte would make every image one
+      // byte short.
       WiFiClient* stream = http.getStreamPtr();
       size_t total = 0;
       const uint32_t deadline = millis() + 30000UL;
       while ((http.connected() || stream->available()) &&
-             millis() < deadline && total < bufferLen - 1) {
+             millis() < deadline && total < bufferLen) {
         const int avail = stream->available();
         if (avail > 0) {
-          size_t room = bufferLen - 1 - total;
+          size_t room = bufferLen - total;
           const int chunk = avail < static_cast<int>(room)
                                 ? avail
                                 : static_cast<int>(room);
@@ -143,7 +148,6 @@ class HttpClientTransport : public insight::InsightTransport {
           delay(1);
         }
       }
-      buffer[total] = '\0';
       if (contentLength != 0) *contentLength = total;
     }
     http.end();

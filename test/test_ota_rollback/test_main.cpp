@@ -215,6 +215,29 @@ void test_confirm_in_time_marks_valid_once_and_no_rollback(void) {
   TEST_ASSERT_EQUAL_INT(0, g_rollbackCalls);
 }
 
+// A markValid() that FAILS (the bootloader flag was not set) must NOT land the
+// trial in the terminal `confirmed` state: the state contract says an observer
+// never sees `confirmed` for a flag that was not actually set. confirm() reports
+// false, the runner stays in `Trial`, and a later retry can still succeed.
+void test_confirm_with_failing_markvalid_stays_trial(void) {
+  InsightOtaRunner runner = makeRunner(InsightOtaRunner::ESP32, kTimeout);
+  runner.arm();
+  advance(1);
+
+  g_markValidResult = false;
+  TEST_ASSERT_FALSE(runner.confirm());
+  TEST_ASSERT_EQUAL_INT(InsightOtaRunner::Trial, runner.state());
+  TEST_ASSERT_FALSE(runner.isConfirmed());
+  TEST_ASSERT_EQUAL_INT(1, g_markValidCalls);  // the attempt was made
+
+  // The window is still open and the trial is still pending: a retry can win.
+  g_markValidResult = true;
+  TEST_ASSERT_TRUE(runner.confirm());
+  TEST_ASSERT_EQUAL_INT(InsightOtaRunner::Confirmed, runner.state());
+  TEST_ASSERT_EQUAL_INT(2, g_markValidCalls);
+  TEST_ASSERT_EQUAL_INT(0, g_rollbackCalls);
+}
+
 // The same property on ESP8266: a confirmed trial is confirmed there too. The
 // platform only changes what an EXPIRY does; confirmation is identical.
 void test_esp8266_confirm_in_time_marks_valid_once(void) {
@@ -610,6 +633,7 @@ int main(int, char**) {
 
   // Confirmation in time: confirmed, markValid once, no rollback
   RUN_TEST(test_confirm_in_time_marks_valid_once_and_no_rollback);
+  RUN_TEST(test_confirm_with_failing_markvalid_stays_trial);
   RUN_TEST(test_esp8266_confirm_in_time_marks_valid_once);
   RUN_TEST(test_confirm_with_null_markvalid_still_confirms);
 
