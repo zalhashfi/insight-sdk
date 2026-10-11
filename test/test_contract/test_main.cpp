@@ -102,11 +102,11 @@ const char* const kControlCommand =
     "{\"control\":[{\"id\":\"c_1\",\"variable\":\"led\",\"value\":1}]}";
 
 // ---------------------------------------------------------------------------
-// OTA route shape (spec §6.4/§6.5; mirrors ota-lock.ts). The routes are not
-// wired server-side yet (M3 / A18b, A18c): these constants freeze the SHAPE —
-// the paths, the firmware request header, the image media type, and the
-// retry/quota/not-found statuses — so the two sides cannot drift while absent.
-// `implemented` mirrors the lock and flips to true only when the routes land.
+// OTA route shape (spec §6.4/§6.5; mirrors ota-lock.ts). The routes are wired
+// server-side as of M3 (A18b, A18c): these constants freeze the SHAPE — the
+// paths, the firmware request header, the image media type, and the
+// retry/quota/not-found statuses — so the two sides cannot drift.
+// `implemented` mirrors the lock's flag.
 // ---------------------------------------------------------------------------
 
 // Request header carrying the RUNNING firmware version (offer + image routes).
@@ -122,18 +122,19 @@ const char* const kOtaImageContentType = "application/octet-stream";
 // The response header a 429 carries (spec §6.5 / D2.8).
 const char* const kOtaRetryAfterHeader = "retry-after";
 
-// Shape of one route, mirroring the lock's `implemented` flag. Header-only:
-// no server route exists yet, so nothing here is fetched.
+// Shape of one route, mirroring the lock's `implemented` flag. The routes were
+// shape-only until M3 (A18b, A18c) wired them server-side; `implemented` now
+// mirrors the lock's `true` on both sides.
 struct OtaRoute {
   const char* method;
   const char* path;
   const char* content_type;  // "" when the route carries no single media type
-  bool implemented;          // false => shape-only (M3 / A18b, A18c)
+  bool implemented;          // true => wired server-side (M3 / A18b, A18c)
 };
 
 const OtaRoute kOtaRoutes[] = {
-    {"GET", "/v1/ota", "", false},
-    {"GET", "/v1/ota/image", "application/octet-stream", false},
+    {"GET", "/v1/ota", "", true},
+    {"GET", "/v1/ota/image", "application/octet-stream", true},
 };
 const int kOtaRouteCount = 2;
 
@@ -477,7 +478,7 @@ void test_ota_route_constants_are_frozen(void) {
   TEST_ASSERT_EQUAL_STRING("application/octet-stream", contract::kOtaImageContentType);
   TEST_ASSERT_EQUAL_STRING("retry-after", contract::kOtaRetryAfterHeader);
 
-  // Both routes: GET, shape-only (no server route yet — M3 / A18b, A18c).
+  // Both routes: GET, now implemented server-side (M3 / A18b, A18c).
   TEST_ASSERT_EQUAL_INT(2, contract::kOtaRouteCount);
   TEST_ASSERT_EQUAL_STRING("GET", contract::kOtaRoutes[0].method);
   TEST_ASSERT_EQUAL_STRING(contract::kOtaOfferPath, contract::kOtaRoutes[0].path);
@@ -485,11 +486,11 @@ void test_ota_route_constants_are_frozen(void) {
   TEST_ASSERT_EQUAL_STRING(contract::kOtaImagePath, contract::kOtaRoutes[1].path);
   TEST_ASSERT_EQUAL_STRING(contract::kOtaImageContentType,
                            contract::kOtaRoutes[1].content_type);
-  TEST_ASSERT_FALSE(contract::kOtaRoutes[0].implemented);
-  TEST_ASSERT_FALSE(contract::kOtaRoutes[1].implemented);
+  TEST_ASSERT_TRUE(contract::kOtaRoutes[0].implemented);
+  TEST_ASSERT_TRUE(contract::kOtaRoutes[1].implemented);
 
-  // The statuses the image route returns once wired: 429 quota, 404 missing.
-  // Same ints the lock freezes; the routes are absent, so nothing is fetched.
+  // The statuses the image route returns: 429 quota, 404 missing. Same ints the
+  // lock freezes.
   TEST_ASSERT_EQUAL_INT(contract::kStatusTooManyRequests, 429);
   TEST_ASSERT_EQUAL_INT(contract::kStatusNotFound, 404);
 }
