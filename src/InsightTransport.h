@@ -15,10 +15,13 @@ struct HttpOutcome {
     Error     // Transport-level failure (DNS, socket, TLS, ...).
   };
 
+  // Which of the three outcomes this is.
   Kind kind;
   int status;  // HTTP status code; only meaningful when kind == Ok.
 
+  // Default-construct an Error outcome (status 0) — the safe "no reply" state.
   HttpOutcome() : kind(Error), status(0) {}
+  // Construct an explicit outcome; `httpStatus` matters only for Ok.
   HttpOutcome(Kind k, int httpStatus = 0) : kind(k), status(httpStatus) {}
 
   static HttpOutcome ok(int httpStatus) { return HttpOutcome(Ok, httpStatus); }

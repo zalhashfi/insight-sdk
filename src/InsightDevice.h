@@ -22,6 +22,7 @@ namespace insight {
 //   * `x-insight-device`   — the sending device's key (FR-DEV-03).
 //   * `x-insight-firmware` — the RUNNING firmware version (FR-SDK-08).
 const char* const kDeviceHeaderName = "x-insight-device";
+// The RUNNING firmware version header name; see InsightDevice::setFirmwareVersion.
 const char* const kFirmwareHeaderName = "x-insight-firmware";
 
 // ---------------------------------------------------------------------------

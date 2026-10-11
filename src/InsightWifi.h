@@ -64,7 +64,11 @@ class InsightWifi {
   // never advance the deadline (see the busy-loop guard below).
   typedef unsigned long (*Clock)();
 
+  // Construct detached with no seams: every attempt fails and time is frozen.
   InsightWifi() : connectAttempt_(0), clock_(0) {}
+
+  // Construct with both seams installed. Either may be null; see the class
+  // comment for what a null seam implies.
   InsightWifi(ConnectAttempt connectAttempt, Clock clock)
       : connectAttempt_(connectAttempt), clock_(clock) {}
 

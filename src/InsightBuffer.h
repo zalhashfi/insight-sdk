@@ -43,8 +43,11 @@ struct MetricValue {
 //   - `null` mirrors MetricValue::hasValue inverted, for readability at the
 //     call site (`if (entry.null) ...`).
 struct BufferEntry {
+  // NUL-terminated key, at most INSIGHT_BUFFER_KEY_MAX bytes.
   char key[INSIGHT_BUFFER_KEY_MAX + 1];
+  // Sample value; meaningful only when `null` is false.
   float value;
+  // True for the "no reading" sentinel (MetricValue::hasValue == false).
   bool null;
 };
 
@@ -52,9 +55,14 @@ struct BufferEntry {
 // oldestEntryView(). The view points into the buffer's own storage, so it is
 // valid until the next push()/clear()/setBufferSize() on that buffer.
 struct BufferEntryView {
+  // Borrowed pointer to the key bytes; NOT NUL-terminated, so `keyLen` is the
+  // only safe bound.
   const char* key;
+  // Length of `key` in bytes.
   size_t keyLen;
+  // Sample value; meaningful only when `null` is false.
   float value;
+  // True for the "no reading" sentinel (BufferEntryView::value is not a reading).
   bool null;
 };
 
@@ -382,9 +390,14 @@ class InsightBuffer {
 // build if that layout ever drifts from the offsets the buffer computes.
 namespace insight {
 namespace layout {
+// A compile-time mirror of BufferEntry's layout, used only for the
+// static_asserts below that pin the computed offsets.
 struct Witness {
+  // Mirrors BufferEntry::key (the key buffer plus its NUL).
   char key[INSIGHT_BUFFER_KEY_MAX + 1];
+  // Mirrors BufferEntry::value.
   float value;
+  // Mirrors BufferEntry::null.
   bool null;
 };
 static_assert(sizeof(Witness) == sizeof(BufferEntry),

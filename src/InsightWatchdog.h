@@ -72,6 +72,8 @@ class InsightWatchdog {
   // the frozen clock can never reach the interval.
   typedef unsigned long (*Clock)();
 
+  // Construct DISABLED (interval 0) with no seams: poll() never feeds until
+  // enable() arms it.
   InsightWatchdog()
       : intervalMs_(0),
         feed_(0),
@@ -82,6 +84,8 @@ class InsightWatchdog {
         due_(false),
         feeds_(0) {}
 
+  // Construct and arm in one step: equivalent to a default-constructed
+  // watchdog followed by setFeed()/setClock()/enable(intervalMs).
   InsightWatchdog(unsigned long intervalMs, Feed feed, Clock clock)
       : intervalMs_(0),
         feed_(feed),

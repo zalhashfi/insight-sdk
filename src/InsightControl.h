@@ -99,11 +99,16 @@ struct ControlCommand {
 // can hold. The batch is still `valid` — the commands that fit are real and
 // actioned — but a caller that cares about the cap can see it was hit.
 struct ControlBatch {
+  // True when the envelope parsed; the gate before touching `commands`.
   bool valid;
+  // Number of valid entries in `commands` (0 when !valid).
   size_t count;
+  // True when the body held more commands than `commands` could hold.
   bool truncated;
+  // The parsed commands, newest policy first, at most INSIGHT_CONTROL_MAX_COMMANDS.
   ControlCommand commands[INSIGHT_CONTROL_MAX_COMMANDS];
 
+  // Construct an empty, invalid batch (the "nothing parsed yet" state).
   ControlBatch() : valid(false), count(0), truncated(false) {}
 };
 

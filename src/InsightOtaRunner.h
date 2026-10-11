@@ -1,6 +1,26 @@
 #ifndef INSIGHT_OTA_RUNNER_H
 #define INSIGHT_OTA_RUNNER_H
 
+// Arduino's ESP cores define `ESP32` / `ESP8266` as command-line macros naming
+// the target. The `Platform` enum below uses those words as enumerators, and a
+// macro rewrites them into a numeric constant — `enum Platform { ESP32 }`
+// becomes `enum Platform { 1 }` and fails to compile. A device sketch also
+// tests `defined(ESP32)` for its own platform split, so the macros cannot
+// simply be dropped: they are saved, undefined only while the enum is declared,
+// then restored verbatim. The enum is interface, the macros are the toolchain's
+// — keeping both means this header is includable from an aggregate like
+// Insight.h without breaking the sketch that included it.
+#ifdef ESP32
+#define INSIGHT_OTA_RUNNER_SAVED_ESP32
+#define INSIGHT_OTA_RUNNER_ESP32_VALUE ESP32
+#undef ESP32
+#endif
+#ifdef ESP8266
+#define INSIGHT_OTA_RUNNER_SAVED_ESP8266
+#define INSIGHT_OTA_RUNNER_ESP8266_VALUE ESP8266
+#undef ESP8266
+#endif
+
 namespace insight {
 
 // ===========================================================================
@@ -129,6 +149,8 @@ class InsightOtaRunner {
   // a good image that merely booted slowly.
   static const unsigned long kDefaultConfirmTimeoutMillis = 30000UL;
 
+  // Construct idle with no seams: ESP32 platform, default confirm window, all
+  // callbacks null. Useful as a placeholder before `begin()`.
   InsightOtaRunner()
       : platform_(ESP32), confirmTimeout_(kDefaultConfirmTimeoutMillis),
         markValid_(0), rollback_(0), clock_(0), state_(Idle), trialStartMs_(0),
@@ -351,5 +373,19 @@ class InsightOtaRunner {
 };
 
 }  // namespace insight
+
+// Restore the target macros saved at the top of this header, so a sketch (or
+// any other header) that tests `defined(ESP32)` after including Insight.h still
+// sees the platform its toolchain reported.
+#ifdef INSIGHT_OTA_RUNNER_SAVED_ESP32
+#define ESP32 INSIGHT_OTA_RUNNER_ESP32_VALUE
+#undef INSIGHT_OTA_RUNNER_SAVED_ESP32
+#undef INSIGHT_OTA_RUNNER_ESP32_VALUE
+#endif
+#ifdef INSIGHT_OTA_RUNNER_SAVED_ESP8266
+#define ESP8266 INSIGHT_OTA_RUNNER_ESP8266_VALUE
+#undef INSIGHT_OTA_RUNNER_SAVED_ESP8266
+#undef INSIGHT_OTA_RUNNER_ESP8266_VALUE
+#endif
 
 #endif  // INSIGHT_OTA_RUNNER_H

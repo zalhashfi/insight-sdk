@@ -74,8 +74,6 @@ class InsightTlsPolicy {
   // accepted `setInsecure()`; a refused request leaves it untouched.
   TlsMode mode() const { return mode_; }
 
-  // Continue verifying the server certificate. Idempotent, always allowed, and
-  // the way back from a debug opt-out. Returns Ok.
   TlsPolicyResult setSecure() {
     mode_ = TlsMode::Secure;
     return TlsPolicyResult::Ok;
