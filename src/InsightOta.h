@@ -63,15 +63,34 @@ const size_t kOtaSha256HexLength = 64;
 struct OtaOffer {
   bool valid;       // the envelope parsed and every present field was well-formed
   bool hasUpdate;   // false => `{ "update": null }`: nothing to do
+  // Offered version string; meaningful when `valid && hasUpdate`.
   char version[64];
   char sha256[65];  // lowercase hex, 64 chars + NUL
+  // Where to fetch the image; meaningful when `valid && hasUpdate`.
   char url[256];
   uint32_t size;    // image length in bytes, as offered
+  // Optional signed-image fields (B14 / FR-OTA-07). Both are absent on a
+  // non-signing server, which leaves them EMPTY and `hasSignature == false` —
+  // that is a legal offer, not a parse failure. When present they are lowercase
+  // hex, bounded, and only ever filled after the same structural check the rest
+  // of the envelope passes; a signature that is not valid hex makes the whole
+  // offer malformed (a server that emits garbage for a security field must not
+  // be silently downgraded to "unsigned").
+  bool hasSignature;
+  // Lowercase-hex signature (up to 128 chars + NUL); meaningful only when
+  // `hasSignature`.
+  char signature[129];
+  // Lowercase-hex signing-key id (up to 64 chars + NUL); empty when the offer
+  // carries none.
+  char pubkeyId[65];
 
-  OtaOffer() : valid(false), hasUpdate(false), size(0) {
+  // Construct an empty, invalid offer (the "nothing parsed yet" state).
+  OtaOffer() : valid(false), hasUpdate(false), size(0), hasSignature(false) {
     version[0] = '\0';
     sha256[0] = '\0';
     url[0] = '\0';
+    signature[0] = '\0';
+    pubkeyId[0] = '\0';
   }
 };
 
@@ -94,8 +113,16 @@ struct OtaOffer {
 //                       (ST-O1(a): a truncated stream); nothing was flashed.
 //   HashMismatch      - the byte count matched but the SHA-256 did not
 //                       (ST-O1(b): the last byte was altered); nothing flashed.
-//   Flashed           - size AND digest both matched; the image was handed to
-//                       the flash sink EXACTLY once.
+//   SignatureMismatch - the image is authentic in the SHA-256 sense but its
+//                       detached signature does not verify against the trusted
+//                       key (B14 / FR-OTA-07 / NFR-SEC-03). Reached ONLY when a
+//                       signature verifier is installed and the offer carries a
+//                       signature to check; nothing was flashed. Distinct from
+//                       HashMismatch so an operator can tell a corrupt transfer
+//                       from a wrongly-signed (or hostile) image.
+//   Flashed           - size AND digest (and, when required, the signature) all
+//                       matched; the image was handed to the flash sink EXACTLY
+//                       once.
 struct OtaResult {
   enum Kind {
     NoUpdate,
@@ -105,9 +132,11 @@ struct OtaResult {
     TransportFailure,
     SizeMismatch,
     HashMismatch,
+    SignatureMismatch,
     Flashed
   };
 
+  // Which outcome of the OTA operation this is.
   Kind kind;
   // True when the caller should try the whole operation again later. Every
   // failure that is not a permanent offer rejection is retry-worthy; the
@@ -128,12 +157,17 @@ struct OtaResult {
   // unless the download completed far enough to hash.
   char computedSha256[65];
 
+  // Construct a TransportFailure result with no schedule recorded — the
+  // "nothing attempted yet" state.
   OtaResult()
       : kind(TransportFailure), retry(false), received(0), retryAtMillis(0),
         retryAfterMillis(0) {
     computedSha256[0] = '\0';
   }
 
+  // Factory for the common case: fill the kind/retry/received/schedule fields
+  // and leave computedSha256 empty. Used everywhere a result is returned
+  // without reaching the hash step.
   static OtaResult make(Kind k, bool retryable, uint32_t receivedBytes,
                         uint32_t retryAt, uint32_t retryAfter) {
     OtaResult r;
@@ -143,6 +177,99 @@ struct OtaResult {
     r.retryAtMillis = retryAt;
     r.retryAfterMillis = retryAfter;
     return r;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Signed-image verification seam (B14 / FR-OTA-07 / NFR-SEC-03)
+// ---------------------------------------------------------------------------
+
+// The detached signature carried by an offer, as lowercase hex, BOUNDED so the
+// copy into OtaOffer can never overrun. 128 hex characters is 64 signature
+// bytes — room for an Ed25519 (64 B) signature and enough headroom that a
+// longer scheme (e.g. a DER ECDSA signature) still has to be checked by the
+// verifier, which is the component that knows the scheme. Anything longer than
+// this is not a signature this SDK could ever verify and is treated as a
+// malformed offer.
+const size_t kOtaSignatureHexMaxLength = 128;
+
+// The `pubkey_id` an offer may carry to name WHICH trusted key signed it. This
+// is the whole reason a signature is not just a boolean: a device may hold more
+// than one trusted key (during a key rotation) and the verifier must know which
+// one the server claims to have used. Bounded like the digest, and lowercase
+// hex by the same parser rule.
+const size_t kOtaPubkeyIdHexMaxLength = 64;
+
+// The crypto seam. This is the ONE piece of the signed-image path that is real
+// cryptography in firmware, and it is deliberately a pair of plain C function
+// pointers — the seam style used throughout this SDK — so that:
+//
+//   * native tests inject a FAKE verifier and prove the POLICY (wrong signature
+//     -> no flash; right signature -> flash) with no crypto library, no key
+//     material and no platform dependency; and
+//   * firmware plugs in its real verifier (ESP32 `UPDATE_SIGN` /
+//     `esp_image_verify_signature`-style, or an Ed25519/ECDSA primitive)
+//     without this header ever naming a crypto package.
+//
+// `verify(image, len, signatureHex, pubkeyIdHex)` returns true ONLY when
+// `signatureHex` is a valid signature, under the trusted key named/selected by
+// `pubkeyIdHex`, over EXACTLY the `len` bytes of `image`. Both strings are
+// NUL-terminated lowercase hex and are never modified by the callee. A null
+// string means the offer did not carry that field and MUST be treated as a
+// verification failure, not a pass.
+//
+// A null `SignatureVerifier` function pointer means "this build has no signing
+// key": signature checking is then SKIPPED entirely and the offer's signature
+// fields are ignored — see InsightOta::setSignatureVerifier() for why that is a
+// deliberate opt-in rather than a silent downgrade.
+typedef bool (*SignatureVerifier)(const uint8_t* image, size_t len, const char* signatureHex, const char* pubkeyIdHex);
+
+// ---------------------------------------------------------------------------
+// The record of what was actually checked, and what was flashed
+// ---------------------------------------------------------------------------
+
+// The end of a signed-conscious OTA pass, as a value. Bounded strings, no
+// pointers: an embedder derives this from its last OtaResult (see
+// makeVerification(), which owns the mapping) and can then log it, hand it to
+// `reconcile`, or compare it against the running image's receipt without this
+// header depending on InsightOta at all.
+//
+// The fields that matter for INV-O4 (the reconciler's "is what I believe
+// running really what got flashed?" question):
+//
+//   * flashed          - a write to the partition happened THIS session. It is
+//                        derived from `result == Flashed` and nothing else, so
+//                        it can never claim a flash the policy did not perform.
+//   * signatureChecked - a verifier was installed AND the offer carried a
+//                        signature, so the accept/reject decision below was
+//                        actually made by crypto. False means "unchecked", which
+//                        is a materially different statement from "verified".
+//   * signatureOk      - that check passed. Only ever true when
+//                        `signatureChecked` is true.
+//
+// `sha256` is the digest the pass computed over what it received (identical to
+// OtaResult::computedSha256). It is intentionally the COMPUTED digest, not the
+// offered one: it is the record of the bytes, so a mismatch between the two is
+// visible in exactly the HashMismatch/SignatureMismatch cases.
+struct ImageVerification {
+  OtaResult::Kind result;      // the pass's outcome kind
+  bool flashed;                // the partition was written (result == Flashed)
+  bool signatureChecked;       // a signature was present AND a verifier ran
+  bool signatureOk;            // the verifier accepted (only possible if checked)
+  char version[64];            // the offered version, when the offer carried one
+  char sha256[65];             // computed digest, lowercase hex ("" if not hashed)
+  char signature[129];         // offered signature hex, as parsed ("" if none)
+  char pubkeyId[65];           // offered key id hex, as parsed ("" if none)
+  uint32_t size;               // offered image length in bytes (0 if not offered)
+  uint32_t received;           // bytes actually received for the image
+
+  ImageVerification()
+      : result(OtaResult::NoUpdate), flashed(false), signatureChecked(false),
+        signatureOk(false), size(0), received(0) {
+    version[0] = '\0';
+    sha256[0] = '\0';
+    signature[0] = '\0';
+    pubkeyId[0] = '\0';
   }
 };
 
@@ -242,14 +369,21 @@ class InsightOta {
     // built-in implementation, so no dynamic allocation crosses the seam.
     static const size_t kContextBytes = 128;
 
+    // Initialise a fresh context.
     typedef void (*Init)(void* ctx);
+    // Absorb `len` bytes of `data` into the context.
     typedef void (*Update)(void* ctx, const uint8_t* data, size_t len);
+    // Finish and write the 32-byte digest to `out`.
     typedef void (*Finalize)(void* ctx, uint8_t out[32]);
 
+    // Init seam; null when unset.
     Init init;
+    // Update seam; null when unset.
     Update update;
+    // Finalize seam; null when unset.
     Finalize finalize;
 
+    // Construct from three seams, any of which may be null (see ready()).
     Sha256(Init i = 0, Update u = 0, Finalize f = 0)
         : init(i), update(u), finalize(f) {}
 
@@ -273,12 +407,20 @@ class InsightOta {
   // Lowercase hex encoding of a 32-byte digest into `out` (needs 65 bytes).
   static void toHex(const uint8_t digest[32], char out[65]);
 
+  // Construct detached with no seams and the default image ceiling; install
+  // the transport/flash/clock seams before use (see setTransport, setFlash...).
   InsightOta()
       : transport_(0), flash_(0), clock_(0), retryAfter_(0), hasher_(),
+        verifySignature_(0), requireSignature_(false),
         maxImage_(INSIGHT_OTA_MAX_IMAGE), nowMillis_(0), nextAttemptAtMillis_(0),
         attempts_(0), lastStatus_(0), lastContentLength_(0),
-        lastRetryAfter_(0), reason_(OtaResult::NoUpdate) {
+        lastRetryAfter_(0), lastSignatureChecked_(false), lastSignatureOk_(false),
+        lastOfferVersion_(), lastOfferSignature_(), lastOfferPubkeyId_(),
+        reason_(OtaResult::NoUpdate) {
     hasher_ = builtInSha256();
+    lastOfferVersion_[0] = '\0';
+    lastOfferSignature_[0] = '\0';
+    lastOfferPubkeyId_[0] = '\0';
   }
 
   // --- seams -------------------------------------------------------------
@@ -319,6 +461,82 @@ class InsightOta {
     maxImage_ = bytes > 0 ? bytes : static_cast<size_t>(INSIGHT_OTA_MAX_IMAGE);
   }
   size_t maxImageSize() const { return maxImage_; }
+
+  // --- the signed-image seam (B14 / FR-OTA-07) ---------------------------
+
+  // Install the detached-signature verifier. Null (the default) means "no
+  // signing key on this device": the offer's signature fields are ignored and
+  // the image is flashed on SHA-256 alone, which is the pre-B14 contract and
+  // keeps every board that has not been given a key source-compatible.
+  //
+  // Non-null means signature checking is ARMED: on every offer that carries a
+  // signature, the verifier runs over the whole buffered image AFTER the size
+  // and SHA-256 checks and BEFORE the flash sink. A false result is a
+  // `SignatureMismatch` and NOTHING is flashed — this is INV-O1 extended from
+  // "the bytes are the bytes that were offered" to "the bytes were signed by
+  // the key we trust", and it is the property NFR-SEC-03 (verify before flash)
+  // and FR-OTA-07 (signed images) exist to provide.
+  void setSignatureVerifier(SignatureVerifier verifier) {
+    verifySignature_ = verifier;
+  }
+  SignatureVerifier signatureVerifier() const { return verifySignature_; }
+
+  // When true, an offer that OMITS a signature is refused (`SignatureMismatch`)
+  // instead of being accepted unsigned. This is the "this device only ever
+  // accepts signed firmware" posture, and it is OFF by default because it is
+  // strictly stronger than the shipped contract: turning it on for a device
+  // whose server does not yet sign images would strand that device (ESP8266
+  // cannot roll back — see InsightOtaRunner — so the mistake would be
+  // permanent). An operator opts in once signing is live end to end.
+  //
+  // Requiring signatures without installing a verifier is a configuration the
+  // policy refuses to act on: it fails closed with `SignatureMismatch` rather
+  // than treating "no key" as "nothing to check".
+  void setRequireSignature(bool require) { requireSignature_ = require; }
+  bool requireSignature() const { return requireSignature_; }
+
+  // Did the LAST pass actually run the verifier (verifier installed AND the
+  // offer carried a signature)? Lets a caller distinguish "verified" from
+  // "unchecked" without re-deriving it from the offer.
+  bool lastSignatureChecked() const { return lastSignatureChecked_; }
+
+  // Did the last signature check pass? Only meaningful when
+  // lastSignatureChecked() is true; false in every other case, including a
+  // rejected image, so it can never report a pass that did not happen.
+  bool lastSignatureOk() const { return lastSignatureOk_; }
+
+  // Snapshot of the last pass as one value, including the offered version /
+  // signature / key id and whether a flash happened. See ImageVerification.
+  // `flashed` is derived from the pass's result kind, so the record can only
+  // ever claim a flash the policy itself performed.
+  ImageVerification lastVerification() const {
+    ImageVerification v;
+    v.result = reason_;
+    v.flashed = (reason_ == OtaResult::Flashed);
+    v.signatureChecked = lastSignatureChecked_;
+    v.signatureOk = lastSignatureOk_;
+    v.size = lastOfferSize_;
+    v.received = lastReceived_;
+    copyInto(v.version, sizeof(v.version), lastOfferVersion_);
+    copyInto(v.sha256, sizeof(v.sha256), lastComputedSha256_);
+    copyInto(v.signature, sizeof(v.signature), lastOfferSignature_);
+    copyInto(v.pubkeyId, sizeof(v.pubkeyId), lastOfferPubkeyId_);
+    return v;
+  }
+
+  // Derive the verification record from a bare result — the seam-free helper
+  // an embedder (or a reconciler) uses when all it kept was the OtaResult.
+  // `flashed` follows from `result.kind == Flashed`, and the digest is the one
+  // the pass computed. Signature fields are left empty because an OtaResult
+  // does not carry them; use lastVerification() when they matter.
+  static ImageVerification makeVerification(const OtaResult& result) {
+    ImageVerification v;
+    v.result = result.kind;
+    v.flashed = (result.kind == OtaResult::Flashed);
+    v.received = result.received;
+    copyInto(v.sha256, sizeof(v.sha256), result.computedSha256);
+    return v;
+  }
 
   // --- the operation -----------------------------------------------------
 
@@ -396,11 +614,33 @@ class InsightOta {
     return clock_ == 0 ? 0u : static_cast<uint32_t>(clock_());
   }
 
+  // Bounded NUL-terminating copy into a fixed record field. A null source
+  // yields an empty string, so an unset field is never a stale or truncated
+  // pointer. Shared by lastVerification()/makeVerification() so both spell the
+  // bound the same way.
+  static void copyInto(char* out, size_t outLen, const char* src) {
+    if (out == 0 || outLen == 0) return;
+    if (src == 0) {
+      out[0] = '\0';
+      return;
+    }
+    size_t i = 0;
+    for (; i + 1 < outLen && src[i] != '\0'; ++i) {
+      out[i] = src[i];
+    }
+    out[i] = '\0';
+  }
+
   InsightTransport* transport_;
   FlashSink flash_;
   Clock clock_;
   RetryAfterSource retryAfter_;
   Sha256 hasher_;
+
+  // Signed-image seam. `verifySignature_ == 0` means "no key on this device":
+  // the signature fields are ignored. See setSignatureVerifier().
+  SignatureVerifier verifySignature_;
+  bool requireSignature_;
 
   size_t maxImage_;
 
@@ -411,6 +651,19 @@ class InsightOta {
   size_t lastContentLength_;
   uint32_t lastRetryAfter_;
   OtaResult::Kind reason_;
+
+  // Signature outcome of the last pass, plus the offer fields it acted on, so
+  // lastVerification() can hand back a self-contained record. These are reset
+  // at the top of every processOffer() so one pass can never report a previous
+  // pass's signature.
+  bool lastSignatureChecked_;
+  bool lastSignatureOk_;
+  char lastOfferVersion_[64];
+  char lastOfferSignature_[129];
+  char lastOfferPubkeyId_[65];
+  char lastComputedSha256_[65];
+  uint32_t lastOfferSize_;
+  uint32_t lastReceived_;
 
   // Staging buffer for the whole image. Sized by the compiled ceiling so the
   // class needs no heap; setMaxImageSize() narrows the usable prefix without

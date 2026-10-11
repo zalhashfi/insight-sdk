@@ -281,6 +281,34 @@ bool normaliseHex64(const char* in, char out[65]) {
   return true;
 }
 
+// The same normalisation for a VARIABLE-length hex field, bounded by `maxChars`
+// and requiring at least one character. It exists for the optional signed-image
+// fields (a signature and a key id), which are not fixed-width: their valid
+// lengths are a property of the signature scheme the verifier implements, not
+// of this parser. What the parser CAN enforce — and does — is that the field is
+// pure lowercase-normalisable hex and no longer than the seam can carry, so a
+// non-hex or over-long security field is refused as a malformed offer instead
+// of being handed to a verifier as garbage/"unsigned".
+bool normaliseHexN(const char* in, char out[], size_t outLen, size_t maxChars,
+                   size_t minChars) {
+  if (outLen == 0) return false;
+  out[0] = '\0';
+  if (in == 0) return false;
+  size_t n = 0;
+  for (; in[n] != '\0'; ++n) {
+    if (n >= maxChars || n + 1 >= outLen) return false;  // too long / no room
+    const char ch = in[n];
+    const bool digit = ch >= '0' && ch <= '9';
+    const bool lower = ch >= 'a' && ch <= 'f';
+    const bool upper = ch >= 'A' && ch <= 'F';
+    if (!digit && !lower && !upper) return false;
+    out[n] = upper ? static_cast<char>(ch - 'A' + 'a') : ch;
+  }
+  if (n < minChars) return false;
+  out[n] = '\0';
+  return true;
+}
+
 }  // namespace
 
 bool InsightOta::parseOffer(const char* json, OtaOffer* offer) {
@@ -323,6 +351,36 @@ bool InsightOta::parseOffer(const char* json, OtaOffer* offer) {
 
   const char* afterUrl = parseString(url, offer->url, sizeof(offer->url));
   if (afterUrl == 0 || offer->url[0] == '\0') return false;
+
+  // Optional signed-image fields (B14 / FR-OTA-07). Absent on a server that
+  // does not sign -> empty, `hasSignature == false`, offer still valid. PRESENT
+  // but malformed (not hex, or over the seam's ceiling) -> the whole offer is
+  // refused: a security field that cannot be read is not the same as one that
+  // was not sent, and quietly ignoring it would silently drop the requirement
+  // the operator asked for.
+  const char* sig = findField(update, "signature");
+  if (sig != 0) {
+    // `findField` lands on the value position (at the `:`); read the JSON
+    // string first, exactly as version/url do, THEN normalise its contents.
+    char sigRaw[256];
+    if (parseString(sig, sigRaw, sizeof(sigRaw)) == 0) return false;
+    if (!normaliseHexN(sigRaw, offer->signature, sizeof(offer->signature),
+                       kOtaSignatureHexMaxLength, 1)) {
+      return false;
+    }
+    offer->hasSignature = true;
+  }
+  const char* keyid = findField(update, "pubkey_id");
+  if (keyid != 0) {
+    // A key id is optional even when a signature is present (a single-key
+    // device does not need one); but if it IS sent it must be well-formed.
+    char keyRaw[128];
+    if (parseString(keyid, keyRaw, sizeof(keyRaw)) == 0) return false;
+    if (!normaliseHexN(keyRaw, offer->pubkeyId, sizeof(offer->pubkeyId),
+                       kOtaPubkeyIdHexMaxLength, 1)) {
+      return false;
+    }
+  }
 
   offer->size = sizeValue;
   offer->valid = true;
@@ -389,6 +447,18 @@ OtaResult InsightOta::processOffer(const char* offerJson) {
   lastRetryAfter_ = 0;
   lastStatus_ = 0;
 
+  // Reset the per-pass record, so a pass that never reaches the signature step
+  // (no update, malformed offer) can never report a prior pass's signature. The
+  // record is only re-populated once an update offer has parsed.
+  lastSignatureChecked_ = false;
+  lastSignatureOk_ = false;
+  lastOfferVersion_[0] = '\0';
+  lastOfferSignature_[0] = '\0';
+  lastOfferPubkeyId_[0] = '\0';
+  lastComputedSha256_[0] = '\0';
+  lastOfferSize_ = 0;
+  lastReceived_ = 0;
+
   OtaOffer offer;
   if (!parseOffer(offerJson, &offer)) {
     reason_ = OtaResult::InvalidOffer;
@@ -398,6 +468,14 @@ OtaResult InsightOta::processOffer(const char* offerJson) {
     reason_ = OtaResult::NoUpdate;
     return OtaResult::make(OtaResult::NoUpdate, false, 0, 0, 0);
   }
+
+  // Record what was OFFERED, so lastVerification() is a self-contained record
+  // of the pass even when the pass later fails before any bytes arrive.
+  lastOfferVersion_[0] = '\0';
+  copyInto(lastOfferVersion_, sizeof(lastOfferVersion_), offer.version);
+  copyInto(lastOfferSignature_, sizeof(lastOfferSignature_), offer.signature);
+  copyInto(lastOfferPubkeyId_, sizeof(lastOfferPubkeyId_), offer.pubkeyId);
+  lastOfferSize_ = offer.size;
 
   // Refuse an offer that cannot be buffered whole (or is empty) BEFORE any
   // image byte is fetched. A size we cannot hold is a size we must not start.
@@ -467,8 +545,76 @@ OtaResult InsightOta::processOffer(const char* offerJson) {
     return result;
   }
 
-  // Size AND digest both match: this is the ONLY reachable call to the flash
-  // sink, and it happens exactly once, with the whole verified image.
+  // Record the computed digest so lastVerification() carries it.
+  copyInto(lastComputedSha256_, sizeof(lastComputedSha256_),
+           result.computedSha256);
+  lastReceived_ = received;
+
+  // --- the signed-image gate (B14 / FR-OTA-07 / NFR-SEC-03) --------------
+  //
+  // Size and SHA-256 prove the bytes are the bytes that were OFFERED; they say
+  // nothing about who offered them (an attacker who can serve the image can
+  // serve its digest too). The signature is what proves authorship, and it is
+  // checked here — after the digest, before the flash — so a wrongly-signed
+  // image is rejected with NOTHING written, exactly like a corrupt one.
+  //
+  // Three cases, and the default is the one that keeps the shipped contract:
+  //
+  //   * no verifier installed  -> signature checking is OFF unless the caller
+  //     opted into `requireSignature()`. With a signature present this is a
+  //     deliberate downgrade (the device has no key); the fields are recorded
+  //     but not enforced. With requireSignature() it FAILS CLOSED instead — a
+  //     device told to require signing must not accept an unsigned image just
+  //     because no key was wired.
+  //   * verifier installed, offer unsigned -> checked only if requireSignature()
+  //     (an unsigned image against a signing device), otherwise accepted on the
+  //     digest alone.
+  //   * verifier installed, offer signed   -> verify, and flash ONLY on true.
+  const bool haveVerifier = (verifySignature_ != 0);
+  const bool haveSignature = offer.hasSignature && offer.signature[0] != '\0';
+
+  if (!haveVerifier && !requireSignature_) {
+    // No key, no requirement: the pre-B14 path. Nothing was signed-checked, and
+    // lastSignatureChecked_ stays false so the record cannot claim otherwise.
+  } else if (!haveVerifier && requireSignature_) {
+    // Unreachable-as-configured: signatures required but no verifier. Fail
+    // closed — an absent key is not a licence to skip the check.
+    reason_ = OtaResult::SignatureMismatch;
+    return OtaResult::make(OtaResult::SignatureMismatch, false, received, 0, 0);
+  } else if (!haveSignature) {
+    // A verifier is installed but the offer carried no signature.
+    lastSignatureChecked_ = false;
+    lastSignatureOk_ = false;
+    if (requireSignature_) {
+      reason_ = OtaResult::SignatureMismatch;
+      return OtaResult::make(OtaResult::SignatureMismatch, false, received, 0,
+                             0);
+    }
+    // else: unsigned image, signing available but not mandatory -> fall through
+    // on the digest (the caller installed a verifier to ENFORCE it; to actually
+    // enforce it for every image, call setRequireSignature(true)).
+  } else {
+    // The real check: the verifier runs over the whole buffered image. The
+    // signature and key id are the parsed lowercase-hex strings, positioned so
+    // a test's fake verifier — or a firmware adapter — can compare them against
+    // what it expects. A false return means "not signed by a trusted key".
+    lastSignatureChecked_ = true;
+    const bool ok = verifySignature_(image_, received, offer.signature,
+                                     offer.pubkeyId[0] != '\0' ? offer.pubkeyId
+                                                               : 0);
+    lastSignatureOk_ = ok;
+    if (!ok) {
+      // Wrong (or hostile) signature: DO NOT flash. Not retryable — the same
+      // bytes would fail the same way, and a retry loop against a bad image is
+      // exactly the hammering the policy avoids.
+      reason_ = OtaResult::SignatureMismatch;
+      return OtaResult::make(OtaResult::SignatureMismatch, false, received, 0, 0);
+    }
+  }
+
+  // Size AND digest (and, when enforced, the signature) all match: this is the
+  // ONLY reachable call to the flash sink, and it happens exactly once, with
+  // the whole verified image.
   const bool written = flash_(image_, received);
   if (!written) {
     const uint32_t wait = backoffMillis(0u);
