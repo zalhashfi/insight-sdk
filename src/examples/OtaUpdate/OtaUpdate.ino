@@ -249,11 +249,18 @@ static uint32_t gLastOtaPollMs = 0;
 static bool gConfirmedThisBoot = false;
 
 // Read the `retry-after` header a 429 carried. The transport seam surfaces only
-// the status, so the honoured value is injected through this hook.
-static void noteRetryAfterFromLastResponse() {
-  // A real adapter would parse the header here. Absent a usable header the SDK
-  // falls back to its one-hour default, which is the correct quota behaviour.
-  insight::setOtaRetryAfterHeader(-1);
+// the status, so the honoured value is supplied to the OTA policy through its
+// per-instance seam: this function is installed with
+// `gOta.setRetryAfterSource(&retryAfterHeaderSeconds)` in setup().
+//
+// A real adapter would parse the last response's `retry-after` header here and
+// return it in whole seconds; absent a usable header it returns a negative
+// value, and the policy falls back to its one-hour default — which is the
+// correct quota behaviour (never an immediate retry).
+static long retryAfterHeaderSeconds() {
+  // No header was captured in this example: report "absent" so the policy uses
+  // its built-in one-hour default. (A real build returns the parsed value.)
+  return -1;
 }
 
 void setup() {
@@ -277,6 +284,9 @@ void setup() {
   gOta.setClock(&millis);
   gOta.setHasher(insight::InsightOta::builtInSha256());
   gOta.setMaxImageSize(1024);  // narrow the RAM guard for this build
+  // Per-instance 429 handling: the policy reads `retry-after` from THIS object's
+  // source, so different OTA objects never share a header.
+  gOta.setRetryAfterSource(&retryAfterHeaderSeconds);
 
   // Wire the trial runner for THIS platform. NOTE: the espressif32 toolchain
   // passes `-DESP32`, so `InsightOtaRunner::ESP32`/`::ESP8266` cannot appear by
@@ -319,7 +329,6 @@ void loop() {
   if (now - gLastOtaPollMs >= kOtaPollPeriodMs) {
     gLastOtaPollMs = now;
     if (gOta.isReady(now)) {
-      noteRetryAfterFromLastResponse();
       const insight::OtaResult result = gOta.run();
 
       switch (result.kind) {

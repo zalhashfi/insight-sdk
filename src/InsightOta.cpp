@@ -336,39 +336,13 @@ bool InsightOta::parseOffer(const char* json, OtaOffer* offer) {
 
 namespace {
 
-// Read the `retry-after` response header for a 429. The transport seam does not
-// surface headers (production parses them from the HTTP response), so an
-// injected header reader is modelled here as a small hook a caller may install.
-// When it is absent — or the header is not a clean non-negative whole number of
-// seconds — the caller falls back to kOtaDefaultRetryAfterMillis.
-//
-// Module-local so the public class stays exactly the four seams the task names
-// (image source, hasher, flash sink, clock); tests inject the header through
-// the provided setter below.
-uint32_t g_retryAfterHeaderSeconds = 0;
-bool g_hasRetryAfterHeader = false;
-
-}  // namespace
-
-// Test/firmware seam for the 429 `retry-after` header. Passing seconds < 0
-// clears the header; 0 is a legitimate (if useless) value.
-void setOtaRetryAfterHeader(long seconds) {
-  if (seconds < 0) {
-    g_hasRetryAfterHeader = false;
-    g_retryAfterHeaderSeconds = 0;
-    return;
-  }
-  g_hasRetryAfterHeader = true;
-  g_retryAfterHeaderSeconds = static_cast<uint32_t>(seconds);
-}
-
-namespace {
-
-// Resolve the retry-after delay, in millis, honoured for a 429.
-uint32_t resolveRetryAfterMillis() {
-  if (!g_hasRetryAfterHeader) return kOtaDefaultRetryAfterMillis;
-  // Seconds -> millis, saturating rather than wrapping on an absurd value.
-  const uint64_t ms = static_cast<uint64_t>(g_retryAfterHeaderSeconds) * 1000u;
+// Resolve the retry-after delay, in millis, honoured for a 429 — from the
+// INSTANCE seam (`retryAfterHeaderSeconds()`), not from any global. A negative
+// (absent/malformed) header keeps the one-hour fallback; a real value is
+// seconds -> millis, saturating rather than wrapping on an absurd value.
+uint32_t resolveRetryAfterMillis(long seconds) {
+  if (seconds < 0) return kOtaDefaultRetryAfterMillis;
+  const uint64_t ms = static_cast<uint64_t>(seconds) * 1000u;
   return ms > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(ms);
 }
 
@@ -451,7 +425,7 @@ OtaResult InsightOta::processOffer(const char* offerJson) {
     // allowed time from `retry-after` (or the one-hour default) and return —
     // never retry inside this pass (INV-O2, ST-O2).
     if (lastStatus_ == 429) {
-      const uint32_t wait = resolveRetryAfterMillis();
+      const uint32_t wait = resolveRetryAfterMillis(retryAfterHeaderSeconds());
       lastRetryAfter_ = wait;
       nextAttemptAtMillis_ = nowMillis_ + wait;
       reason_ = OtaResult::RateLimited;
@@ -552,7 +526,7 @@ OtaResult InsightOta::run() {
   }
   if (outcome.status == 429) {
     nowMillis_ = readClock();
-    const uint32_t wait = resolveRetryAfterMillis();
+    const uint32_t wait = resolveRetryAfterMillis(retryAfterHeaderSeconds());
     lastRetryAfter_ = wait;
     nextAttemptAtMillis_ = nowMillis_ + wait;
     reason_ = OtaResult::RateLimited;

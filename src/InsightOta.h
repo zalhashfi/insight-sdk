@@ -200,6 +200,32 @@ class InsightOta {
   // unobservable but never crashes — scheduleability is the caller's concern.
   typedef unsigned long (*Clock)();
 
+  // The 429 `retry-after` seam. The transport surfaces only the status of a
+  // reply, not its headers, so the `retry-after` value a 429 carried is supplied
+  // through this per-instance hook. Semantics, exactly:
+  //
+  //   * returns the header's value in WHOLE SECONDS when the last response
+  //     carried a usable (non-negative integer) `retry-after`;
+  //   * returns a NEGATIVE value when it did not (absent, malformed, or no
+  //     response yet), which makes a 429 fall back to
+  //     `kOtaDefaultRetryAfterMillis`.
+  //
+  // It is INSTANCE state, not global: two InsightOta objects — different
+  // devices, different projects, or two test cases in one binary — never share a
+  // header, so one NIT's test can no longer leak a stale value into another's
+  // (the isolation the old module-global setter could not give). Firmware wires
+  // this to parse the response it just saw (see the OtaUpdate example);
+  // a null source means "no header was captured", i.e. always the default.
+  typedef long (*RetryAfterSource)();
+
+  // Read `retry-after` (whole seconds) for the last response from the installed
+  // source; a negative result means "no usable header". When no source is
+  // installed this is the default/absent case, which resolves to the one-hour
+  // fallback rather than to an immediate retry (INV-O2).
+  long retryAfterHeaderSeconds() const {
+    return retryAfter_ == 0 ? -1 : retryAfter_();
+  }
+
   // --- the SHA-256 algorithm seam ---------------------------------------
   //
   // The digest is injected so the policy is testable with a stand-in hash *and*
@@ -248,7 +274,7 @@ class InsightOta {
   static void toHex(const uint8_t digest[32], char out[65]);
 
   InsightOta()
-      : transport_(0), flash_(0), clock_(0), hasher_(),
+      : transport_(0), flash_(0), clock_(0), retryAfter_(0), hasher_(),
         maxImage_(INSIGHT_OTA_MAX_IMAGE), nowMillis_(0), nextAttemptAtMillis_(0),
         attempts_(0), lastStatus_(0), lastContentLength_(0),
         lastRetryAfter_(0), reason_(OtaResult::NoUpdate) {
@@ -273,6 +299,12 @@ class InsightOta {
   // Install the wall clock. Null reads as a constant zero.
   void setClock(Clock clock) { clock_ = clock; }
   Clock clock() const { return clock_; }
+
+  // Install the 429 `retry-after` source (instance-scoped; see the typedef for
+  // its exact contract). Null detaches it: a 429 then takes the default wait,
+  // never an immediate retry.
+  void setRetryAfterSource(RetryAfterSource source) { retryAfter_ = source; }
+  RetryAfterSource retryAfterSource() const { return retryAfter_; }
 
   // Install the digest algorithm. Passing an unready Sha256() restores the
   // built-in implementation, so a half-configured hasher can never be used.
@@ -367,6 +399,7 @@ class InsightOta {
   InsightTransport* transport_;
   FlashSink flash_;
   Clock clock_;
+  RetryAfterSource retryAfter_;
   Sha256 hasher_;
 
   size_t maxImage_;
@@ -384,14 +417,6 @@ class InsightOta {
   // changing the footprint.
   uint8_t image_[INSIGHT_OTA_MAX_IMAGE];
 };
-
-// Inject the `retry-after` header value (whole seconds) that a 429 response
-// carried. The transport seam surfaces only the status, not headers, so the
-// header is supplied through this hook: firmware sets it from the response it
-// just parsed, and tests set it directly. Passing a negative value clears it,
-// which makes a 429 fall back to kOtaDefaultRetryAfterMillis. Defined in
-// InsightOta.cpp.
-void setOtaRetryAfterHeader(long seconds);
 
 }  // namespace insight
 

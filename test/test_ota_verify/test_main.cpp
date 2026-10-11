@@ -7,6 +7,8 @@
 //   * a full length, altered end-> hash mismatch -> flash NOT invoked
 //   * correct size + hash       -> flash invoked EXACTLY once, with the bytes
 //   * a 429 -> schedule >= retry-after, and NO retry inside the pass (INV-O2)
+//   * the 429 `retry-after` value is an INSTANCE seam, so it cannot leak across
+//     objects/tests (the whole reason it is not a module-global)
 //   * a real SHA-256 verified against known-answer vectors
 //
 // "Flash NOT invoked" is proven, not asserted: the flash sink is injected and
@@ -132,6 +134,44 @@ struct TestClock {
 TestClock* g_clock = nullptr;
 unsigned long clockRead() { return g_clock->read(); }
 
+// A per-instance `retry-after` source: the whole point of the instance seam. A
+// test OWNS one stub per `InsightOta` and installs it with `stub.install(&ota)`.
+// Each stub carries its OWN reader function pointer, so the two objects hold
+// genuinely different sources and the policy resolves the right value from its
+// own identity — exactly how a firmware adapter looks (one reader per context).
+// A single shared trampoline, or a process-global "current" value (what the old
+// free-function setter effectively was), would alias the two objects; the
+// isolation test below fails loudly if either returns.
+struct RetryAfterStub {
+  long seconds = -1;            // negative => "no usable header" (default)
+  long (*source)() = 0;         // this stub's private reader
+  void install(insight::InsightOta* ota) { ota->setRetryAfterSource(source); }
+};
+
+// Two concrete readers, so two stubs get distinct (non-aliasing) pointers.
+RetryAfterStub* g_stubA = 0;
+RetryAfterStub* g_stubB = 0;
+long readStubA() { return g_stubA == 0 ? -1 : g_stubA->seconds; }
+long readStubB() { return g_stubB == 0 ? -1 : g_stubB->seconds; }
+
+// Make stub A/B: assign the reader and register the global the reader closes over.
+RetryAfterStub makeStubA(long seconds) {
+  RetryAfterStub s;
+  s.seconds = seconds;
+  s.source = &readStubA;
+  g_stubA = 0;  // rebound by bindStubA once the local's lifetime is fixed
+  return s;
+}
+RetryAfterStub makeStubB(long seconds) {
+  RetryAfterStub s;
+  s.seconds = seconds;
+  s.source = &readStubB;
+  g_stubB = 0;
+  return s;
+}
+void bindStubA(RetryAfterStub& s) { g_stubA = &s; s.source = &readStubA; }
+void bindStubB(RetryAfterStub& s) { g_stubB = &s; s.source = &readStubB; }
+
 // The image the happy-path tests use: bytes 0..255. Its digest and the digest
 // of the last-byte-altered variant are known constants (see the vectors below);
 // both were confirmed against an independent SHA-256.
@@ -184,7 +224,12 @@ void buildOffer(char* out, size_t outLen, const char* version, uint32_t size,
 
 }  // namespace
 
-void setUp(void) {}
+void setUp(void) {
+  // Detach both retry-after readers so an earlier test's stub can never be
+  // observed by a later one.
+  g_stubA = 0;
+  g_stubB = 0;
+}
 
 void tearDown(void) {}
 
@@ -430,6 +475,133 @@ void test_truncated_midway_is_size_mismatch_not_hash(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics: lastContentLength() reports the RAW seam byte count
+// ---------------------------------------------------------------------------
+
+// `lastContentLength()` is the transport's own report of how many bytes the last
+// GET delivered — distinct from `received`, which is the count the verification
+// path trusted AFTER the size check. On a truncated read the two deliberately
+// DIVERGE: `received` is the short delivered length (the mismatch is computed
+// from it), while a well-behaved seam's content-length report agrees with it
+// too. This test pins the accessor to that raw report rather than leaving it an
+// unexercised getter.
+void test_last_content_length_reports_short_delivery(void) {
+  initImage();
+  ScriptedTransport transport;
+  FlashRecorder flash;
+  TestClock clock;
+
+  flash.bind();
+  g_clock = &clock;
+
+  transport.image = g_image;
+  transport.imageLen = kImageLen - 1;  // deliver 255 of the promised 256
+  transport.imageOutcome = insight::HttpOutcome::ok(200);
+  std::strncpy(transport.lastImagePath, insight::otaImagePath(),
+               sizeof(transport.lastImagePath) - 1);
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setFlashSink(&FlashRecorder::trampoline);
+  ota.setClock(&clockRead);
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  insight::OtaResult result = ota.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::SizeMismatch, result.kind);
+  // The seam reported 255 bytes; the accessor surfaces exactly that, and it
+  // equals what the verification path measured.
+  TEST_ASSERT_EQUAL_UINT32(kImageLen - 1,
+                           static_cast<uint32_t>(ota.lastContentLength()));
+  TEST_ASSERT_EQUAL_UINT32(result.received,
+                           static_cast<uint32_t>(ota.lastContentLength()));
+  TEST_ASSERT_EQUAL_INT(200, ota.lastStatus());
+}
+
+// On a full, correct download the raw content-length report equals the offered
+// size (the happy path where `received` and `lastContentLength()` must agree),
+// and the GET count is exactly one image fetch.
+void test_last_content_length_reports_whole_delivery(void) {
+  initImage();
+  ScriptedTransport transport;
+  FlashRecorder flash;
+  TestClock clock;
+
+  flash.bind();
+  g_clock = &clock;
+
+  transport.image = g_image;
+  transport.imageLen = kImageLen;
+  transport.imageOutcome = insight::HttpOutcome::ok(200);
+  std::strncpy(transport.lastImagePath, insight::otaImagePath(),
+               sizeof(transport.lastImagePath) - 1);
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setFlashSink(&FlashRecorder::trampoline);
+  ota.setClock(&clockRead);
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  insight::OtaResult result = ota.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::Flashed, result.kind);
+  TEST_ASSERT_EQUAL_UINT32(kImageLen,
+                           static_cast<uint32_t>(ota.lastContentLength()));
+  TEST_ASSERT_EQUAL_UINT32(result.received,
+                           static_cast<uint32_t>(ota.lastContentLength()));
+  TEST_ASSERT_EQUAL_INT(1, transport.imageCount);
+}
+
+// A transport failure (no reply at all) leaves the content-length report at 0 —
+// the accessor must not carry a stale count from a previous, successful pass.
+// Mutation-proven: forcing the failure branch to keep the last good count turns
+// this red.
+void test_last_content_length_is_zero_after_transport_failure(void) {
+  initImage();
+  ScriptedTransport transport;
+  FlashRecorder flash;
+  TestClock clock;
+
+  flash.bind();
+  g_clock = &clock;
+
+  transport.image = g_image;
+  transport.imageLen = kImageLen;
+  transport.imageOutcome = insight::HttpOutcome::ok(200);
+  std::strncpy(transport.lastImagePath, insight::otaImagePath(),
+               sizeof(transport.lastImagePath) - 1);
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setFlashSink(&FlashRecorder::trampoline);
+  ota.setClock(&clockRead);
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  // First pass: a successful whole download, so the accessor holds 256.
+  insight::OtaResult first = ota.runWithOffer(offer);
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::Flashed, first.kind);
+  TEST_ASSERT_EQUAL_UINT32(kImageLen,
+                           static_cast<uint32_t>(ota.lastContentLength()));
+
+  // Second pass: the image GET times out (kind != Ok), so no bytes were
+  // delivered — the report must reset to 0, not linger at 256.
+  transport.imageOutcome = insight::HttpOutcome::timeout();
+  insight::OtaResult second = ota.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::TransportFailure, second.kind);
+  TEST_ASSERT_EQUAL_UINT32(0, static_cast<uint32_t>(ota.lastContentLength()));
+}
+
+// ---------------------------------------------------------------------------
 // ST-O1 / acceptance: altered last byte -> hash mismatch -> NO flash
 // ---------------------------------------------------------------------------
 
@@ -585,12 +757,14 @@ void test_429_on_image_honours_retry_after_without_retry(void) {
   std::strncpy(transport.lastImagePath, insight::otaImagePath(),
                sizeof(transport.lastImagePath) - 1);
 
-  insight::setOtaRetryAfterHeader(30);  // server says: wait 30 s
+  RetryAfterStub retry = makeStubA(30);  // server says: wait 30 s
+  bindStubA(retry);
 
   insight::InsightOta ota;
   ota.setTransport(&transport);
   ota.setFlashSink(&FlashRecorder::trampoline);
   ota.setClock(&clockRead);
+  retry.install(&ota);
 
   char offer[512];
   buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
@@ -601,6 +775,8 @@ void test_429_on_image_honours_retry_after_without_retry(void) {
   TEST_ASSERT_EQUAL_INT(insight::OtaResult::RateLimited, result.kind);
   TEST_ASSERT_TRUE(result.retry);
   TEST_ASSERT_EQUAL_INT(0, flash.calls);
+  // The instance seam is what supplied the header.
+  TEST_ASSERT_EQUAL_INT(30L, ota.retryAfterHeaderSeconds());
   // Scheduled at or AFTER retry-after (30 s from now == 1000).
   TEST_ASSERT_EQUAL_UINT32(30000u, result.retryAfterMillis);
   TEST_ASSERT_GREATER_OR_EQUAL_UINT32(31000u, result.retryAtMillis);
@@ -612,8 +788,6 @@ void test_429_on_image_honours_retry_after_without_retry(void) {
   TEST_ASSERT_FALSE(ota.isReady(1000));
   TEST_ASSERT_FALSE(ota.isReady(30999));
   TEST_ASSERT_TRUE(ota.isReady(31000));
-
-  insight::setOtaRetryAfterHeader(-1);  // reset the seam for other tests
 }
 
 // A 429 that carries NO usable retry-after falls back to the one-hour default —
@@ -632,12 +806,13 @@ void test_429_without_header_uses_default_retry_after(void) {
   transport.imageOutcome = insight::HttpOutcome::ok(429);
   std::strncpy(transport.lastImagePath, insight::otaImagePath(),
                sizeof(transport.lastImagePath) - 1);
-  insight::setOtaRetryAfterHeader(-1);  // no header
 
   insight::InsightOta ota;
   ota.setTransport(&transport);
   ota.setFlashSink(&FlashRecorder::trampoline);
   ota.setClock(&clockRead);
+  // No retry-after source installed at all: the absent-header case.
+  TEST_ASSERT_EQUAL_INT(-1L, ota.retryAfterHeaderSeconds());
 
   char offer[512];
   buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
@@ -664,12 +839,14 @@ void test_429_on_offer_is_honoured(void) {
   clock.t = 5000;
 
   transport.offerOutcome = insight::HttpOutcome::ok(429);
-  insight::setOtaRetryAfterHeader(60);
+  RetryAfterStub retry = makeStubA(60);
+  bindStubA(retry);
 
   insight::InsightOta ota;
   ota.setTransport(&transport);
   ota.setFlashSink(&FlashRecorder::trampoline);
   ota.setClock(&clockRead);
+  retry.install(&ota);
 
   insight::OtaResult result = ota.run();
 
@@ -678,8 +855,79 @@ void test_429_on_offer_is_honoured(void) {
   TEST_ASSERT_EQUAL_INT(0, transport.imageCount);  // no image GET on a 429 offer
   TEST_ASSERT_EQUAL_INT(0, flash.calls);
   TEST_ASSERT_EQUAL_UINT32(60000u, result.retryAfterMillis);
+}
 
-  insight::setOtaRetryAfterHeader(-1);
+// The `retry-after` value is INSTANCE state, not a process global: two objects
+// with their own sources never share a header. This is the isolation the old
+// module-global setter could not give (and the reason the seam was moved onto
+// the class) — a 429 on one object must not inherit the other's schedule.
+void test_retry_after_source_is_per_instance(void) {
+  ScriptedTransport transportA;
+  ScriptedTransport transportB;
+  FlashRecorder flashA;
+  FlashRecorder flashB;
+  TestClock clock;
+
+  g_clock = &clock;
+  clock.t = 0;
+
+  // Two independent 429 sources: stub A reads 5 s, stub B reads 90 s.
+  RetryAfterStub retryA = makeStubA(5);
+  RetryAfterStub retryB = makeStubB(90);
+  bindStubA(retryA);
+  bindStubB(retryB);
+
+  // Build BOTH objects and install BOTH sources BEFORE either runs. This is the
+  // ordering that exposes a global seam: with a process-global "last value
+  // wins" (the old setOtaRetryAfterHeader), installing B after A would clobber
+  // A's 5 s, and object A — which must honour ITS OWN 5 s — would schedule 90 s.
+  flashA.bind();
+  transportA.image = g_image;
+  transportA.imageLen = kImageLen;
+  transportA.imageOutcome = insight::HttpOutcome::ok(429);
+  std::strncpy(transportA.lastImagePath, insight::otaImagePath(),
+               sizeof(transportA.lastImagePath) - 1);
+
+  insight::InsightOta otaA;
+  otaA.setTransport(&transportA);
+  otaA.setFlashSink(&FlashRecorder::trampoline);
+  otaA.setClock(&clockRead);
+  retryA.install(&otaA);
+
+  flashB.bind();
+  transportB.image = g_image;
+  transportB.imageLen = kImageLen;
+  transportB.imageOutcome = insight::HttpOutcome::ok(429);
+  std::strncpy(transportB.lastImagePath, insight::otaImagePath(),
+               sizeof(transportB.lastImagePath) - 1);
+
+  insight::InsightOta otaB;
+  otaB.setTransport(&transportB);
+  otaB.setFlashSink(&FlashRecorder::trampoline);
+  otaB.setClock(&clockRead);
+  retryB.install(&otaB);  // installed AFTER A — a global would now read 90 s
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  // Run A AFTER B's source was installed. A must still honour 5 s.
+  flashA.bind();
+  insight::OtaResult resultA = otaA.runWithOffer(offer);
+  flashB.bind();
+  insight::OtaResult resultB = otaB.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::RateLimited, resultA.kind);
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::RateLimited, resultB.kind);
+  TEST_ASSERT_EQUAL_UINT32(5000u, resultA.retryAfterMillis);
+  TEST_ASSERT_EQUAL_UINT32(90000u, resultB.retryAfterMillis);
+  // The two objects store independent deadlines — A's is NOT B's.
+  TEST_ASSERT_EQUAL_UINT32(5000u, otaA.nextAttemptAtMillis());
+  TEST_ASSERT_EQUAL_UINT32(90000u, otaB.nextAttemptAtMillis());
+  TEST_ASSERT_FALSE(otaA.isReady(4999));
+  TEST_ASSERT_TRUE(otaA.isReady(5000));
+  TEST_ASSERT_FALSE(otaB.isReady(89999));
+  TEST_ASSERT_TRUE(otaB.isReady(90000));
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +1169,10 @@ int main(int, char**) {
   // ST-O1: truncated -> no flash
   RUN_TEST(test_truncated_stream_does_not_flash);
   RUN_TEST(test_truncated_midway_is_size_mismatch_not_hash);
+  // Diagnostics: lastContentLength() seam report
+  RUN_TEST(test_last_content_length_reports_short_delivery);
+  RUN_TEST(test_last_content_length_reports_whole_delivery);
+  RUN_TEST(test_last_content_length_is_zero_after_transport_failure);
   // ST-O1: altered last byte -> hash mismatch -> no flash
   RUN_TEST(test_altered_last_byte_fails_hash_and_does_not_flash);
   // Acceptance: correct size + hash -> flash exactly once
@@ -931,6 +1183,7 @@ int main(int, char**) {
   RUN_TEST(test_429_on_image_honours_retry_after_without_retry);
   RUN_TEST(test_429_without_header_uses_default_retry_after);
   RUN_TEST(test_429_on_offer_is_honoured);
+  RUN_TEST(test_retry_after_source_is_per_instance);
   // Transport failures / seams
   RUN_TEST(test_image_transport_failure_does_not_flash);
   RUN_TEST(test_flash_write_failure_is_reported_but_reached_once);
