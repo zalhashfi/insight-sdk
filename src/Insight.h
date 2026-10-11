@@ -37,11 +37,10 @@ class Insight {
   }
 
   // GET `path` into `buffer` through the installed transport.
-  HttpOutcome get(const char* path, char* buffer, size_t bufferLen) {
-    if (transport_ == 0) {
-      return HttpOutcome::error();
-    }
-    return transport_->get(path, buffer, bufferLen);
+  HttpOutcome get(const char* path, char* buffer, size_t bufferLen,
+                  size_t* contentLength = 0) {
+    if (transport_ == 0) return HttpOutcome::error();
+    return transport_->get(path, buffer, bufferLen, contentLength);
   }
 
  private:

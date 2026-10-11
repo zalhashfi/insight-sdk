@@ -40,8 +40,15 @@ class InsightTransport {
   // GET `path` into `buffer` of `bufferLen` bytes (null-terminated on
   // success). Reports the outcome of the attempt; `buffer` is only filled
   // on a response.
-  virtual HttpOutcome get(const char* path, char* buffer,
-                          size_t bufferLen) = 0;
+  //
+  // `contentLength`, when non-null, receives the number of BODY bytes the
+  // response delivered, independent of any NUL terminator. A TEXT body (for
+  // example a JSON envelope) may be measured with strlen(); an OPAQUE body —
+  // a firmware image — may contain NUL bytes and MUST be measured with this
+  // count, which is exactly why the seam exposes it. On a non-OK outcome the
+  // count is left at 0.
+  virtual HttpOutcome get(const char* path, char* buffer, size_t bufferLen,
+                          size_t* contentLength = 0) = 0;
 };
 
 }  // namespace insight

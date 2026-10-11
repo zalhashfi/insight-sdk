@@ -61,7 +61,7 @@ class ScriptedTransport : public insight::InsightTransport {
     return outcome;
   }
 
-  insight::HttpOutcome get(const char*, char*, size_t) override {
+  insight::HttpOutcome get(const char*, char*, size_t, size_t*) override {
     return insight::HttpOutcome::error();
   }
 };
@@ -81,7 +81,7 @@ class CountingTransport : public insight::InsightTransport {
     return insight::HttpOutcome::error();
   }
 
-  insight::HttpOutcome get(const char*, char*, size_t) override {
+  insight::HttpOutcome get(const char*, char*, size_t, size_t*) override {
     return insight::HttpOutcome::error();
   }
 };

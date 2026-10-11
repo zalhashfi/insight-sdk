@@ -26,13 +26,17 @@ class FakeTransport : public insight::InsightTransport {
     return postResult;
   }
 
-  insight::HttpOutcome get(const char* path, char* buffer,
-                           size_t bufferLen) override {
+  insight::HttpOutcome get(const char* path, char* buffer, size_t bufferLen,
+                           size_t* contentLength) override {
     ++getCount;
     std::strncpy(lastPath, path, sizeof(lastPath) - 1);
     if (bufferLen > 0) {
       std::strncpy(buffer, getBody, bufferLen - 1);
       buffer[bufferLen - 1] = '\0';
+    }
+    if (contentLength != 0) {
+      const size_t len = std::strlen(getBody);
+      *contentLength = len < bufferLen ? len : bufferLen;
     }
     return getResult;
   }

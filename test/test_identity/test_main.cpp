@@ -83,9 +83,11 @@ class RecordingTransport : public insight::InsightTransport {
   }
 
   insight::HttpOutcome get(const char* path, char* /*buffer*/,
-                           size_t /*bufferLen*/) override {
+                           size_t /*bufferLen*/,
+                           size_t* contentLength) override {
     ++getCount;
     std::strncpy(lastPath, path, sizeof(lastPath) - 1);
+    if (contentLength != 0) *contentLength = 0;
     return insight::HttpOutcome::ok(200);
   }
 };
