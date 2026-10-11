@@ -64,7 +64,7 @@ const ErrorEntry kErrors[] = {
     {"too_many_metrics", kStatusPayloadTooLarge, true},
     {"payload_too_large", kStatusPayloadTooLarge, true},
     {"unauthorized", kStatusUnauthorized, true},
-    {"rate_limited", kStatusTooManyRequests, false},
+    {"rate_limited", kStatusTooManyRequests, true},
 };
 const int kErrorCount = 7;
 
@@ -340,8 +340,9 @@ void test_error_code_to_status_mapping(void) {
       TEST_FAIL_MESSAGE("unknown contract error code");
     }
   }
-  // Marked-not-yet-implemented parts are exactly rate_limited (M3/A18).
-  TEST_ASSERT_FALSE(contract::kErrors[6].implemented);
+  // Every error code is now live: rate_limited is wired into the telemetry
+  // ingest route (429 + retry-after), so no entry stays shape-only.
+  TEST_ASSERT_TRUE(contract::kErrors[6].implemented);
   TEST_ASSERT_TRUE(contract::kErrors[0].implemented);
 }
 
