@@ -7,12 +7,17 @@
 // valid while the richer client is layered on top.
 //
 // What it locks down (see spec §6.1/§6.2/§6.4):
-//   * Header names: Authorization / x-insight-device / x-insight-firmware.
+//   * Header names: authorization (LOWERCASE, the lock's exact bytes) /
+//     x-insight-device / x-insight-firmware, plus case-insensitive matching.
 //   * The telemetry body shapes the device may send.
 //   * The expected status/parse outcomes for POST /v1/telemetry.
 //   * The GET /v1/control envelope `{ "control": [ {id,variable,value} ] }`.
 //   * The GET /v1/ota envelope `{ "update": null | {version,size,sha256,url} }`.
 //     OTA has no server route yet (M3 / A18); its shape is encoded here.
+//
+// The mirror below is cross-checked for drift by the insight side:
+// `insight/test/contracts/mirror.test.ts` parses these C++ constants and
+// asserts them equal to `contract-lock.ts`, so a one-sided edit fails there.
 
 #include <unity.h>
 
@@ -28,8 +33,11 @@
 
 namespace contract {
 
-// Header names.
-const char* const kHeaderAuthorization = "Authorization";
+// Header names. Lowercase and byte-for-byte identical to contract-lock.ts
+// (`CONTRACT_HEADERS.authorization`); HTTP header NAMES are case-insensitive so
+// the wire value is the same either spelling, but the mirror is held to the
+// lock's exact bytes so a one-sided edit fails the cross-repo drift guard.
+const char* const kHeaderAuthorization = "authorization";
 const char* const kHeaderDevice = "x-insight-device";
 const char* const kHeaderFirmware = "x-insight-firmware";
 
@@ -76,6 +84,12 @@ const char* const kFieldMetric = "metric";
 const char* const kFieldUpdate = "update";
 const char* const kFieldControl = "control";
 const char* const kFieldIds = "ids";
+
+// A rejection body, byte-exact to the lock's `{ error, message }` shape. Held
+// as a fixture (not assembled from kFieldError/kFieldMessage) so the mirror
+// guard can parse it and prove the field NAMES, not just the constants.
+const char* const kErrorBody =
+    "{\"error\":\"invalid_key\",\"message\":\"metric key must not be empty\"}";
 
 // GET /v1/ota response bodies (spec §6.4).
 const char* const kOtaNoUpdate = "{\"update\":null}";
@@ -156,6 +170,21 @@ bool keyIsArray(const char* s, const char* name) {
   return *p == '[';
 }
 
+// HTTP header NAMES are case-insensitive (RFC 9110 §5.1). Compare two names
+// that way, so the mechanical matching the SDK does never depends on casing.
+bool headerNameEquals(const char* a, const char* b) {
+  if (a == 0 || b == 0) return false;
+  while (*a != '\0' && *b != '\0') {
+    if (std::tolower(static_cast<unsigned char>(*a)) !=
+        std::tolower(static_cast<unsigned char>(*b))) {
+      return false;
+    }
+    ++a;
+    ++b;
+  }
+  return *a == '\0' && *b == '\0';
+}
+
 }  // namespace json
 
 // ---------------------------------------------------------------------------
@@ -215,14 +244,28 @@ void tearDown(void) {}
 // ---------------------------------------------------------------------------
 
 void test_header_names_are_frozen(void) {
-  TEST_ASSERT_EQUAL_STRING("Authorization", contract::kHeaderAuthorization);
+  // The frozen spellings are the lock's exact bytes: `authorization` is
+  // LOWERCASE. A one-sided drift here fails insight's mirror guard.
+  TEST_ASSERT_EQUAL_STRING("authorization", contract::kHeaderAuthorization);
   TEST_ASSERT_EQUAL_STRING("x-insight-device", contract::kHeaderDevice);
   TEST_ASSERT_EQUAL_STRING("x-insight-firmware", contract::kHeaderFirmware);
 
   HeaderSet h;
-  TEST_ASSERT_EQUAL_STRING("Authorization", h.authorization);
+  TEST_ASSERT_EQUAL_STRING("authorization", h.authorization);
   TEST_ASSERT_EQUAL_STRING("x-insight-device", h.device);
   TEST_ASSERT_EQUAL_STRING("x-insight-firmware", h.firmware);
+}
+
+// HTTP header NAMES are case-insensitive (RFC 9110 §5.1), so the server — which
+// reads `authorization` — also accepts the conventional `Authorization`. This
+// pins the SDK's mechanical header matching to that rule instead of an exact
+// byte compare, which is what made the historic mixed case a no-op on the wire.
+void test_header_name_matching_is_case_insensitive(void) {
+  TEST_ASSERT_TRUE(json::headerNameEquals(contract::kHeaderAuthorization, "authorization"));
+  TEST_ASSERT_TRUE(json::headerNameEquals(contract::kHeaderAuthorization, "Authorization"));
+  TEST_ASSERT_TRUE(json::headerNameEquals(contract::kHeaderAuthorization, "AUTHORIZATION"));
+  TEST_ASSERT_TRUE(json::headerNameEquals(contract::kHeaderDevice, "X-Insight-Device"));
+  TEST_ASSERT_FALSE(json::headerNameEquals(contract::kHeaderAuthorization, "x-insight-device"));
 }
 
 // ---------------------------------------------------------------------------
@@ -338,9 +381,8 @@ void test_telemetry_body_shapes_are_wellformed(void) {
 }
 
 void test_error_body_field_names(void) {
-  const char* body = "{\"error\":\"invalid_key\",\"message\":\"metric key must not be empty\"}";
-  TEST_ASSERT_TRUE(json::hasKey(body, contract::kFieldError));
-  TEST_ASSERT_TRUE(json::hasKey(body, contract::kFieldMessage));
+  TEST_ASSERT_TRUE(json::hasKey(contract::kErrorBody, contract::kFieldError));
+  TEST_ASSERT_TRUE(json::hasKey(contract::kErrorBody, contract::kFieldMessage));
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +426,7 @@ void test_ota_envelope_shapes(void) {
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_header_names_are_frozen);
+  RUN_TEST(test_header_name_matching_is_case_insensitive);
   RUN_TEST(test_status_codes_are_frozen);
   RUN_TEST(test_error_code_to_status_mapping);
   RUN_TEST(test_outcome_classification_204_accepted);
