@@ -101,6 +101,42 @@ const char* const kControlEmpty = "{\"control\":[]}";
 const char* const kControlCommand =
     "{\"control\":[{\"id\":\"c_1\",\"variable\":\"led\",\"value\":1}]}";
 
+// ---------------------------------------------------------------------------
+// OTA route shape (spec §6.4/§6.5; mirrors ota-lock.ts). The routes are not
+// wired server-side yet (M3 / A18b, A18c): these constants freeze the SHAPE —
+// the paths, the firmware request header, the image media type, and the
+// retry/quota/not-found statuses — so the two sides cannot drift while absent.
+// `implemented` mirrors the lock and flips to true only when the routes land.
+// ---------------------------------------------------------------------------
+
+// Request header carrying the RUNNING firmware version (offer + image routes).
+const char* const kOtaFirmwareHeader = "x-insight-firmware";
+
+// The two frozen paths of the OTA path family.
+const char* const kOtaOfferPath = "/v1/ota";
+const char* const kOtaImagePath = "/v1/ota/image";
+
+// Media type of the image body (spec §6.5).
+const char* const kOtaImageContentType = "application/octet-stream";
+
+// The response header a 429 carries (spec §6.5 / D2.8).
+const char* const kOtaRetryAfterHeader = "retry-after";
+
+// Shape of one route, mirroring the lock's `implemented` flag. Header-only:
+// no server route exists yet, so nothing here is fetched.
+struct OtaRoute {
+  const char* method;
+  const char* path;
+  const char* content_type;  // "" when the route carries no single media type
+  bool implemented;          // false => shape-only (M3 / A18b, A18c)
+};
+
+const OtaRoute kOtaRoutes[] = {
+    {"GET", "/v1/ota", "", false},
+    {"GET", "/v1/ota/image", "application/octet-stream", false},
+};
+const int kOtaRouteCount = 2;
+
 }  // namespace contract
 
 // ---------------------------------------------------------------------------
@@ -427,6 +463,36 @@ void test_ota_envelope_shapes(void) {
   TEST_ASSERT_EQUAL_INT(1, json::countKey(contract::kOtaUpdate, "version"));
 }
 
+// The OTA ROUTE constants (spec §6.4/§6.5): paths, request header, media type
+// and the retry-after header. Mirrored from `ota-lock.ts`; parsed TEXTUALLY by
+// insight's `mirror.test.ts`, so a one-sided edit fails there.
+void test_ota_route_constants_are_frozen(void) {
+  // The offer and image paths (the `/v1/ota` family).
+  TEST_ASSERT_EQUAL_STRING("/v1/ota", contract::kOtaOfferPath);
+  TEST_ASSERT_EQUAL_STRING("/v1/ota/image", contract::kOtaImagePath);
+  TEST_ASSERT_EQUAL_STRING(contract::kHeaderFirmware, contract::kOtaFirmwareHeader);
+
+  // The image body is served as octet-stream; a 429 carries retry-after.
+  TEST_ASSERT_EQUAL_STRING("application/octet-stream", contract::kOtaImageContentType);
+  TEST_ASSERT_EQUAL_STRING("retry-after", contract::kOtaRetryAfterHeader);
+
+  // Both routes: GET, shape-only (no server route yet — M3 / A18b, A18c).
+  TEST_ASSERT_EQUAL_INT(2, contract::kOtaRouteCount);
+  TEST_ASSERT_EQUAL_STRING("GET", contract::kOtaRoutes[0].method);
+  TEST_ASSERT_EQUAL_STRING(contract::kOtaOfferPath, contract::kOtaRoutes[0].path);
+  TEST_ASSERT_EQUAL_STRING("GET", contract::kOtaRoutes[1].method);
+  TEST_ASSERT_EQUAL_STRING(contract::kOtaImagePath, contract::kOtaRoutes[1].path);
+  TEST_ASSERT_EQUAL_STRING(contract::kOtaImageContentType,
+                           contract::kOtaRoutes[1].content_type);
+  TEST_ASSERT_FALSE(contract::kOtaRoutes[0].implemented);
+  TEST_ASSERT_FALSE(contract::kOtaRoutes[1].implemented);
+
+  // The statuses the image route returns once wired: 429 quota, 404 missing.
+  // Same ints the lock freezes; the routes are absent, so nothing is fetched.
+  TEST_ASSERT_EQUAL_INT(contract::kStatusTooManyRequests, 429);
+  TEST_ASSERT_EQUAL_INT(contract::kStatusNotFound, 404);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_header_names_are_frozen);
@@ -441,5 +507,6 @@ int main(int, char**) {
   RUN_TEST(test_error_body_field_names);
   RUN_TEST(test_control_envelope_shapes);
   RUN_TEST(test_ota_envelope_shapes);
+  RUN_TEST(test_ota_route_constants_are_frozen);
   return UNITY_END();
 }
