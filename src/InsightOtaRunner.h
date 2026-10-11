@@ -121,12 +121,22 @@ class InsightOtaRunner {
   // `ReattemptRequired` is intentionally NOT terminal in the same way: it says
   // the trial expired but no rollback was possible, so the caller owns the next
   // move. It is a distinct outcome from `RolledBack` by design (INV-O4).
+  //
+  // `RollbackFailed` is the ESP32 expiry whose rollback seam was PRESENT but
+  // returned false — the bootloader flag was not set, so the device did NOT
+  // return to a known-good image. It is deliberately NOT `RolledBack`: claiming
+  // a rollback the bootloader refused would be exactly the false-recovery this
+  // state exists to prevent (mirroring the confirm()-on-markValid-failure rule).
+  // A caller treats it like `ReattemptRequired` — no recovery happened, retry —
+  // but the two stay distinct so an operator can tell "no rollback exists on
+  // this chip" (ESP8266) from "rollback exists and FAILED" (ESP32, bad slot).
   enum State {
     Idle,               // nothing armed yet (the state after construction)
     Trial,              // flashed, running on probation, awaiting confirm()
     Confirmed,          // confirm() arrived in time; markValid() was called
-    RolledBack,         // ESP32 trial expired -> rollback() called
-    ReattemptRequired   // ESP8266 trial expired -> no rollback possible
+    RolledBack,         // ESP32 trial expired -> rollback() called and SUCCEEDED
+    ReattemptRequired,  // ESP8266 trial expired -> no rollback possible
+    RollbackFailed      // ESP32 trial expired -> rollback() was called and FAILED
   };
 
   // Mark the running trial image as valid/bootable. Returns true on success.
@@ -287,18 +297,41 @@ class InsightOtaRunner {
   bool isConfirmed() const { return state_ == Confirmed; }
   bool isRolledBack() const { return state_ == RolledBack; }
   bool isReattemptRequired() const { return state_ == ReattemptRequired; }
+  // The ESP32 expiry whose rollback seam ran and FAILED (or was absent): the
+  // device did not return to a known-good image. Distinct from `isRolledBack()`
+  // on purpose — see the State enum.
+  bool isRollbackFailed() const { return state_ == RollbackFailed; }
 
-  // True when the trial's confirmation window has closed (state is terminal on
-  // both platforms: rolledBack or reattemptRequired).
+  // True when the trial's confirmation window has closed and no successful
+  // recovery is pending. That is rolledBack, reattemptRequired AND
+  // rollbackFailed: in all three the trial is over (it will never be confirmed),
+  // even though only `rolledBack` claims the device is back on the old image.
   bool isExpired() const {
-    return state_ == RolledBack || state_ == ReattemptRequired;
+    return state_ == RolledBack || state_ == ReattemptRequired ||
+           state_ == RollbackFailed;
+  }
+
+  // True when the update could not be confirmed AND the device is not back on a
+  // known-good image, so the caller must reattempt the update. Covers both the
+  // ESP8266 no-slot case and the ESP32 failed-rollback case — the operator's
+  // next action is the same, but `isRolledBack()` stays false for both.
+  bool needsReattempt() const {
+    return state_ == ReattemptRequired || state_ == RollbackFailed;
   }
 
   // millis() at which the armed trial began, or 0 before any arm().
   unsigned long armedAtMillis() const { return trialStartMs_; }
 
-  // Deadline of the current/last trial, in the clock's millis() domain. Only
-  // meaningful while a trial has been armed at least once.
+  // Deadline of the current/last trial, in the clock's millis() domain, or 0
+  // before any arm(). Computed as `trialStartMs_ + confirmTimeout_` in unsigned
+  // 32-bit arithmetic, so a trial armed near the top of the millis() range
+  // wraps through zero EXACTLY as `elapsedMillis()` (an unsigned subtraction)
+  // measures it — the two agree across the rollover because both are plain
+  // modular arithmetic. It is deliberately NOT saturated: a saturated deadline
+  // would sit above the wrapped clock and never be reached, so a trial armed
+  // just before the wrap could never expire. Every consumer compares against a
+  // clock reading in the same wrapped domain (poll/pollAt use subtraction,
+  // never this absolute value), so the wrap is the correct, in-domain answer.
   unsigned long deadlineMillis() const {
     return trialStartMs_ + confirmTimeout_;
   }
@@ -343,6 +376,14 @@ class InsightOtaRunner {
 
   // The single expiry transition, shared by poll() and pollAt(). Branches on
   // the platform and is careful about every seam being optional.
+  //
+  // The state a trial lands in reflects what actually HAPPENED, not merely what
+  // was attempted: on ESP32 the rollback is invoked (never through a null seam)
+  // and `RolledBack` is recorded ONLY when it reports success. A present-but-
+  // failing rollback lands in `RollbackFailed` instead — the device did not
+  // return to a known-good image and the caller must retry — so a caller can
+  // never read a successful recovery out of a rollback that did not happen.
+  // A false return is recorded, never escalated into a panic or a crash.
   void expire() {
     ++expireCount_;
     if (platform_ == ESP8266) {
@@ -353,14 +394,17 @@ class InsightOtaRunner {
       return;
     }
     // ESP32: the two-slot bootloader can be pointed back at the previous image.
-    // A missing rollback seam is not an error here — we simply have no bootloader
-    // to talk to, and the state transition is still recorded. The seam is never
-    // called when absent, and a false return is not escalated into a panic.
-    if (rollback_ != 0) {
-      rollback_();
-      ++rollbackCalls_;
+    // A missing rollback seam is not an error here — we simply have no
+    // bootloader to talk to. The transition then records the truth: no seam and
+    // no successful rollback means the recovery did NOT happen, so it is
+    // `RollbackFailed` (retry), never a phantom `RolledBack`.
+    if (rollback_ == 0) {
+      state_ = RollbackFailed;
+      return;
     }
-    state_ = RolledBack;
+    const bool ok = rollback_();
+    ++rollbackCalls_;
+    state_ = ok ? RolledBack : RollbackFailed;
   }
 
   Platform platform_;

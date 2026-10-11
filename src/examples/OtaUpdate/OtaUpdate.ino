@@ -79,6 +79,12 @@ static const char* kDeviceKey = "esp-node-01";
 static const char* kFirmwareVersion = "1.0.0";  // x-insight-firmware
 static const uint32_t kOtaPollPeriodMs = 3600000UL;  // once an hour (quota)
 
+// Watchdog seam: the single definition lives here so the transport adapter's
+// read loop (below) can feed it while it waits for body bytes. The real feed
+// routine is installed in setup() via setFeed(); the constructor takes a
+// millisecond clock and no feed fn yet.
+static insight::InsightWatchdog gWatchdog(10000UL, /*feed=*/0, &millis);
+
 // ---------------------------------------------------------------------------
 // Transport adapter (same seam as SensorTelemetry).
 // ---------------------------------------------------------------------------
@@ -88,9 +94,12 @@ class HttpClientTransport : public insight::InsightTransport {
 
   insight::HttpOutcome postJson(const char* path, const char* json) override {
 #if defined(ESP8266) || defined(ESP32)
+    char url[192];
     WiFiClient client;
     HTTPClient http;
-    if (!http.begin(client, urlFor(path))) return insight::HttpOutcome::error();
+    if (!http.begin(client, buildUrl(base_, path, url, sizeof(url)))) {
+      return insight::HttpOutcome::error();
+    }
     http.addHeader("Content-Type", "application/json");
     http.addHeader("x-insight-device", kDeviceKey);
     const int status =
@@ -108,9 +117,12 @@ class HttpClientTransport : public insight::InsightTransport {
   insight::HttpOutcome get(const char* path, char* buffer, size_t bufferLen,
                            size_t* contentLength) override {
 #if defined(ESP8266) || defined(ESP32)
+    char url[192];
     WiFiClient client;
     HTTPClient http;
-    if (!http.begin(client, urlFor(path))) return insight::HttpOutcome::error();
+    if (!http.begin(client, buildUrl(base_, path, url, sizeof(url)))) {
+      return insight::HttpOutcome::error();
+    }
     // OTA requests carry BOTH identity headers: the device key and the RUNNING
     // firmware version (the firmware header is OTA-only, per the contract).
     http.addHeader("x-insight-device", kDeviceKey);
@@ -130,9 +142,16 @@ class HttpClientTransport : public insight::InsightTransport {
       // byte short.
       WiFiClient* stream = http.getStreamPtr();
       size_t total = 0;
+      // Wall-clock budget for the WHOLE body. `millis()`-based (not a loop
+      // counter) so it is bounded regardless of chunk cadence; the caller's
+      // policy measures the delivered length and reports SizeMismatch if this
+      // budget cuts the transfer short, so a timeout is a clean, recoverable
+      // outcome rather than a hang.
       const uint32_t deadline = millis() + 30000UL;
-      while ((http.connected() || stream->available()) &&
-             millis() < deadline && total < bufferLen) {
+      while (total < bufferLen) {
+        // Rollover-safe: `millis() - deadline` is an unsigned subtraction, so
+        // the comparison survives a wrap of the 32-bit counter.
+        if (static_cast<int32_t>(millis() - deadline) >= 0) break;
         const int avail = stream->available();
         if (avail > 0) {
           size_t room = bufferLen - total;
@@ -144,7 +163,16 @@ class HttpClientTransport : public insight::InsightTransport {
                                 static_cast<size_t>(chunk));
           if (got == 0) break;
           total += got;
+        } else if (!http.connected()) {
+          // Nothing buffered and the socket is closed: the body is complete
+          // (or the server hung up). Stop rather than spin.
+          break;
         } else {
+          // Waiting for more bytes. Feed the WATCHDOG while we wait: a blocking
+          // delay(1) loop here would starve the feed and trip the watchdog
+          // during a slow image transfer. gWatchdog.poll() is a no-op while the
+          // flash write has it paused, so this is safe to call unconditionally.
+          gWatchdog.poll();
           delay(1);
         }
       }
@@ -163,22 +191,36 @@ class HttpClientTransport : public insight::InsightTransport {
 
  private:
   const char* base_;
-  const char* urlFor(const char* path) {
-    static char url[192];
+
+  // Build the absolute URL for `path` into the CALLER-supplied buffer and return
+  // it. `url`/`urlLen` belong to the caller (a per-call local), so two threads
+  // or two nested requests can never clobber a shared static — the previous
+  // version returned a pointer into a function-local `static char url[192]`,
+  // which is not reentrant and would silently corrupt an in-flight URL if this
+  // transport were ever driven from more than one context. Truncation is
+  // impossible for the sizes here (base + path << the caller's buffer), but the
+  // copy still bounds the write so it can never overrun.
+  static const char* buildUrl(const char* base, const char* path, char* url,
+                              size_t urlLen) {
+    if (url == 0 || urlLen == 0) return "";
     size_t n = 0;
-    const char* b = base_ != 0 ? base_ : "";
-    while (*b != '\0' && n + 1 < sizeof(url)) url[n++] = *b++;
-    while (path != 0 && *path != '\0' && n + 1 < sizeof(url)) url[n++] = *path++;
+    for (const char* b = base != 0 ? base : ""; *b != '\0' && n + 1 < urlLen;
+         ++b) {
+      url[n++] = *b;
+    }
+    for (const char* p = path; p != 0 && *p != '\0' && n + 1 < urlLen; ++p) {
+      url[n++] = *p;
+    }
     url[n] = '\0';
     return url;
   }
 };
 
 // ---------------------------------------------------------------------------
-// Watchdog seam: a real feed routine, paused around the flash write.
+// Watchdog feed routine (the object itself is defined at the top, before the
+// transport adapter that also feeds it), installed in setup() with setFeed().
+// The watchdog is paused around the flash write.
 // ---------------------------------------------------------------------------
-static insight::InsightWatchdog gWatchdog(10000UL, /*feed=*/0, &millis);
-
 static void feedWatchdog() {
 #if defined(ESP8266)
   ESP.wdtFeed();
@@ -194,25 +236,43 @@ static void feedWatchdog() {
 // Flash sink: the ONLY path to the partition. It is called at most once, and
 // only with a fully verified image. The watchdog is PAUSED for the whole write
 // so a mid-write feed cannot reset the device.
+//
+// Any failure ABORTS or otherwise leaves the update uncommitted, so a torn
+// write cannot be booted. A partially written slot left committed is the
+// danger: the next boot could select a half-written image. On ESP32
+// `Update.abort()` closes the session and invalidates the incomplete slot; on
+// ESP8266 the Updater has no public abort and the image is simply never
+// committed (end(true) — the step that makes it bootable — is skipped on
+// failure). Either way a failed write leaves the device on the KNOWN-GOOD image.
+// Returning false then tells the policy to report TransportFailure and retry —
+// the flash failure is PROPAGATED, never swallowed.
 // ---------------------------------------------------------------------------
 static bool flashImage(const uint8_t* image, size_t len) {
   gWatchdog.pause();
   bool ok = false;
 #if defined(ESP8266)
   // ESP8266 has a single application slot; Update.begin() maps the next image
-  // over the running one.
+  // over the running one. Its Updater exposes no abort(); a failed write leaves
+  // the update session unfinished, and `Update.end(true)` is the only public
+  // close. We therefore do NOT call end() on failure — end() would commit a
+  // partial image — and simply return false so the policy reports the failure
+  // and the device keeps running the current image until a clean retry. (The
+  // ESP8266 core's Updater has no public cancel; the partial write is not
+  // committed because end() is what makes the image bootable.)
   if (Update.begin(len)) {
     ok = Update.write(const_cast<uint8_t*>(image), len) == len;
     if (ok) ok = Update.end(true);
   }
 #elif defined(ESP32)
   // ESP32 has two app slots; the running image is left alone, so a failed boot
-  // of the new slot can be rolled back by the bootloader.
+  // of the new slot can be rolled back by the bootloader. abort() marks the
+  // in-progress slot invalid so the bootloader cannot select it.
   ok = Update.begin(len);
   if (ok) {
     ok = Update.write(const_cast<uint8_t*>(image), len) == len;
     if (ok) ok = Update.end(true);
   }
+  if (!ok) Update.abort();
 #else
   (void)image;
   (void)len;
@@ -251,6 +311,29 @@ static insight::InsightOtaRunner gRunner;
 
 static uint32_t gLastOtaPollMs = 0;
 static bool gConfirmedThisBoot = false;
+
+// Reboot into the freshly flashed image. The two-phase trial is only meaningful
+// ACROSS a boot: InsightOtaRunner holds its trial state in RAM, so on the next
+// power-up the runner is `Idle` again and would never see the trial this boot
+// armed. The runner's job — confirm the NEW image, or roll it back to the OLD
+// one — only happens on the boot that actually RUNS the new image. So once a
+// successful flash has armed the trial, the device must reboot now: on ESP32 the
+// bootloader boots the new slot on probation and, if this sketch never confirms
+// there, rolls back; on ESP8266 there is one slot and the new image simply runs.
+//
+// Without this reboot the trial armed here expires against the STILL-RUNNING old
+// image (which of course never confirms the version it is not running), and the
+// ESP32 rollback path would be invoked for a slot the device never booted —
+// exactly the false-recovery the trial exists to prevent.
+static void rebootIntoNewImage() {
+#if defined(ESP8266) || defined(ESP32)
+  Serial.println("OTA: image flashed + verified — rebooting to confirm");
+  delay(100);  // let the serial line flush before the reset
+  ESP.restart();
+#else
+  // host: there is no bootloader to reboot into; nothing to do.
+#endif
+}
 
 // Read the `retry-after` header a 429 carried. The transport seam surfaces only
 // the status, so the honoured value is supplied to the OTA policy through its
@@ -329,34 +412,54 @@ void loop() {
   // pass; it acts at most once, exactly at or past the deadline.
   gRunner.poll();
 
-  // --- offer -> verify -> flash, scheduled by the policy (429-aware) --------
-  if (now - gLastOtaPollMs >= kOtaPollPeriodMs) {
+  // --- offer -> verify -> flash --------------------------------------------
+  //
+  // The poll cadence and the RETRY cadence are separate gates, and both must be
+  // honoured:
+  //
+  //   * kOtaPollPeriodMs is the QUOTA cadence (one offer per hour, D2.8) — the
+  //     most often we even ASK about an update in the steady state.
+  //   * isReady(now) is the POLICY's own schedule, which a 429 or a transport
+  //     failure sets to `retryAtMillis` (for a 429, `now + retry-after`).
+  //
+  // Gating ONLY on the hourly period (the previous code) let the hour throw away
+  // the schedule the policy had just recorded: a 429 with a 5-minute
+  // retry-after would be ignored for the rest of the hour. Here the policy's
+  // readiness can PULL THE NEXT OFFER FORWARD — if it says it is ready before the
+  // hour is up, we act on that (a scheduled retry is authoritative), but we
+  // never poll MORE than the quota period unless the policy explicitly asked.
+  const bool quotaElapsed = (now - gLastOtaPollMs) >= kOtaPollPeriodMs;
+  if (gOta.isReady(now) && (quotaElapsed || gOta.nextAttemptAtMillis() != 0)) {
     gLastOtaPollMs = now;
-    if (gOta.isReady(now)) {
-      const insight::OtaResult result = gOta.run();
+    const insight::OtaResult result = gOta.run();
 
-      switch (result.kind) {
-        case insight::OtaResult::Flashed:
-          // The image wrote in full and verified. PHASE 1: arm the trial — the
-          // new image is on probation and must confirm itself on the next boot.
-          gRunner.arm();
-          gConfirmedThisBoot = false;
-          break;
+    switch (result.kind) {
+      case insight::OtaResult::Flashed:
+        // The image wrote in full and verified. PHASE 1: arm the trial — the
+        // new image is on probation — then REBOOT so the trial is actually
+        // exercised by the boot that runs the new image (see
+        // rebootIntoNewImage()). This reboots; nothing after it runs.
+        gRunner.arm();
+        gConfirmedThisBoot = false;
+        rebootIntoNewImage();
+        break;
 
-        case insight::OtaResult::RateLimited:
-        case insight::OtaResult::TransportFailure:
-        case insight::OtaResult::SizeMismatch:
-        case insight::OtaResult::HashMismatch:
-          // Retryable: the policy already recorded retryAtMillis; the loop
-          // simply respects isReady() and never sleeps on it.
-          break;
+      case insight::OtaResult::RateLimited:
+      case insight::OtaResult::TransportFailure:
+      case insight::OtaResult::SizeMismatch:
+      case insight::OtaResult::HashMismatch:
+      case insight::OtaResult::SignatureMismatch:
+        // Retryable (or a bad-signature/stuck-trial case the operator must see):
+        // the policy already recorded retryAtMillis; the loop simply respects
+        // isReady() and never sleeps on it. SignatureMismatch is included so the
+        // switch is EXHAUSTIVE over the enum — a signed image rejected by the
+        // verifier must not fall through to the "permanent, ignore" default.
+        break;
 
-        case insight::OtaResult::UnsupportedSize:
-        case insight::OtaResult::InvalidOffer:
-        case insight::OtaResult::NoUpdate:
-        default:
-          break;  // Permanent (or nothing to do): do not retry this offer.
-      }
+      case insight::OtaResult::UnsupportedSize:
+      case insight::OtaResult::InvalidOffer:
+      case insight::OtaResult::NoUpdate:
+        break;  // Permanent (or nothing to do): do not retry this offer.
     }
   }
 
@@ -365,6 +468,8 @@ void loop() {
     Serial.println("OTA: trial expired, rolled back to previous image (ESP32)");
   } else if (gRunner.isReattemptRequired()) {
     Serial.println("OTA: trial expired, no rollback possible — reattempt (ESP8266)");
+  } else if (gRunner.isRollbackFailed()) {
+    Serial.println("OTA: trial expired, rollback FAILED — reattempt (ESP32)");
   } else if (gRunner.isConfirmed()) {
     Serial.println("OTA: running image confirmed healthy");
   }

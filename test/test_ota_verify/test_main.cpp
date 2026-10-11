@@ -24,6 +24,7 @@
 #include <unity.h>
 
 #include <cstring>
+#include <new>
 
 #include "InsightOta.h"
 #include "InsightTransport.h"
@@ -52,6 +53,12 @@ class ScriptedTransport : public insight::InsightTransport {
   int offerCount = 0;
   int imageCount = 0;
   char lastImagePath[128] = {0};
+  // When non-zero, the image GET reports THIS as its delivered length instead of
+  // the bytes actually copied — models a transport whose content-length
+  // out-parameter disagrees with reality (an over-report, or a lying seam). The
+  // policy must trust the report for the size gate, so an over-report is a
+  // SizeMismatch, not a silent pass.
+  size_t reportedImageLen = 0;
 
   insight::HttpOutcome postJson(const char*, const char*) override {
     return insight::HttpOutcome::error();
@@ -74,7 +81,10 @@ class ScriptedTransport : public insight::InsightTransport {
           buffer[i] = static_cast<char>(image[i]);
         }
         if (copyLen < bufferLen) buffer[copyLen] = '\0';
-        if (contentLength != 0) *contentLength = copyLen;
+        if (contentLength != 0) {
+          *contentLength =
+              reportedImageLen != 0 ? reportedImageLen : copyLen;
+        }
       }
       return imageOutcome;
     }
@@ -1152,6 +1162,294 @@ void test_injected_hasher_is_used(void) {
   TEST_ASSERT_EQUAL_INT(1, flash.calls);
 }
 
+// A response that delivers MORE bytes than the offer promised is a size
+// mismatch, NOT silently clamped to the promised length. Clamping would make an
+// over-long delivery pass the size gate (received == offer.size) and only be
+// caught — if at all — by the digest. The seam's over-report must be measured
+// and rejected at the size gate. Mutation-proven: restoring the clamp turns this
+// red (it would flash, or report HashMismatch instead of SizeMismatch).
+void test_over_long_body_is_size_mismatch_not_clamped(void) {
+  initImage();
+  ScriptedTransport transport;
+  FlashRecorder flash;
+  TestClock clock;
+
+  flash.bind();
+  g_clock = &clock;
+
+  // The transport reports it delivered 300 bytes though the offer promised 256.
+  transport.image = g_image;
+  transport.imageLen = kImageLen;
+  transport.reportedImageLen = kImageLen + 44;  // a lying/over-long seam
+  transport.imageOutcome = insight::HttpOutcome::ok(200);
+  std::strncpy(transport.lastImagePath, insight::otaImagePath(),
+               sizeof(transport.lastImagePath) - 1);
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setFlashSink(&FlashRecorder::trampoline);
+  ota.setClock(&clockRead);
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  insight::OtaResult result = ota.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::SizeMismatch, result.kind);
+  TEST_ASSERT_EQUAL_INT(0, flash.calls);
+  // The over-report is surfaced, not clamped to 256.
+  TEST_ASSERT_EQUAL_UINT32(kImageLen + 44, result.received);
+}
+
+// A HashMismatch carries its diagnostics: the OtaResult's computed digest is
+// populated AND lastVerification() reports the digest and byte count. The
+// failure case is exactly the one an operator needs to diagnose, so an empty
+// record here (the previous behaviour) was the bug. Mutation-proven: moving the
+// digest copy back behind the equality check turns this red.
+void test_hash_mismatch_carries_diagnostics(void) {
+  initImage();
+  g_image[kImageLen - 1] ^= 0x01;  // alter the last byte -> digest mismatch
+
+  ScriptedTransport transport;
+  FlashRecorder flash;
+  TestClock clock;
+
+  flash.bind();
+  g_clock = &clock;
+
+  transport.image = g_image;
+  transport.imageLen = kImageLen;
+  transport.imageOutcome = insight::HttpOutcome::ok(200);
+  std::strncpy(transport.lastImagePath, insight::otaImagePath(),
+               sizeof(transport.lastImagePath) - 1);
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setFlashSink(&FlashRecorder::trampoline);
+  ota.setClock(&clockRead);
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  insight::OtaResult result = ota.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::HashMismatch, result.kind);
+  // The computed digest is on the RESULT...
+  TEST_ASSERT_EQUAL_STRING(
+      "e71c077cfa03d2b1a50115d48f98e1edbfb9151759826f6ff6e9766c2ca0e73f",
+      result.computedSha256);
+  // ...and on the RECORD, together with the byte count — the failure is not
+  // recorded as the "nothing happened" blank it used to be.
+  insight::ImageVerification v = ota.lastVerification();
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::HashMismatch, v.result);
+  TEST_ASSERT_FALSE(v.flashed);
+  TEST_ASSERT_EQUAL_STRING(result.computedSha256, v.sha256);
+  TEST_ASSERT_EQUAL_UINT32(kImageLen, v.received);
+  TEST_ASSERT_EQUAL_STRING("2.0.0", v.version);
+}
+
+// A SizeMismatch also carries diagnostics: the byte count received, and the
+// offered version — while leaving the digest empty (nothing was hashed, and an
+// empty digest must not be mistaken for a computed one).
+void test_size_mismatch_carries_diagnostics(void) {
+  initImage();
+  ScriptedTransport transport;
+  FlashRecorder flash;
+  TestClock clock;
+
+  flash.bind();
+  g_clock = &clock;
+
+  transport.image = g_image;
+  transport.imageLen = kImageLen - 1;
+  transport.imageOutcome = insight::HttpOutcome::ok(200);
+  std::strncpy(transport.lastImagePath, insight::otaImagePath(),
+               sizeof(transport.lastImagePath) - 1);
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setFlashSink(&FlashRecorder::trampoline);
+  ota.setClock(&clockRead);
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  insight::OtaResult result = ota.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::SizeMismatch, result.kind);
+  insight::ImageVerification v = ota.lastVerification();
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::SizeMismatch, v.result);
+  TEST_ASSERT_EQUAL_UINT32(kImageLen - 1, v.received);
+  TEST_ASSERT_EQUAL_UINT32(kImageLen, v.size);  // what was OFFERED
+  TEST_ASSERT_EQUAL_STRING("", v.sha256);       // nothing was hashed
+  TEST_ASSERT_FALSE(v.flashed);
+}
+
+// lastVerification() on a NEVER-run object is the inert "nothing happened"
+// record, not indeterminate memory. Reads every field, so an uninitialised
+// member (the previous bug: the ctor left lastComputedSha256_/lastOfferSize_/
+// lastReceived_ unset) is caught.
+//
+// The object is constructed over POISONED memory (a byte pattern of 0xAB) so
+// "the field happens to be zero in a fresh stack frame" cannot mask the bug:
+// without the ctor's member-init list, the fields would read a run of 0xAB and
+// fail the equality checks. Mutation-proven: dropping the member-initialisers
+// (lastComputedSha256_/lastOfferSize_/lastReceived_) turns this red.
+void test_verification_before_first_run_is_inert(void) {
+  alignas(insight::InsightOta) unsigned char storage[sizeof(insight::InsightOta)];
+  std::memset(storage, 0xAB, sizeof(storage));
+  insight::InsightOta* ota =
+      new (storage) insight::InsightOta();  // placement-new over the poison
+
+  insight::ImageVerification v = ota->lastVerification();
+  TEST_ASSERT_FALSE(v.flashed);
+  TEST_ASSERT_FALSE(v.signatureChecked);
+  TEST_ASSERT_FALSE(v.signatureOk);
+  TEST_ASSERT_EQUAL_STRING("", v.sha256);
+  TEST_ASSERT_EQUAL_STRING("", v.version);
+  TEST_ASSERT_EQUAL_STRING("", v.signature);
+  TEST_ASSERT_EQUAL_STRING("", v.pubkeyId);
+  TEST_ASSERT_EQUAL_UINT32(0u, v.size);
+  TEST_ASSERT_EQUAL_UINT32(0u, v.received);
+
+  ota->~InsightOta();
+}
+
+// An unsupported size is a PERMANENT refusal: retry == false and no schedule, so
+// a caller that honours `retry` cannot spin on a size it can never buffer
+// (INV-O2). It previously returned retry == true with no schedule.
+void test_unsupported_size_is_not_retryable(void) {
+  ScriptedTransport transport;
+  FlashRecorder flash;
+  TestClock clock;
+
+  flash.bind();
+  g_clock = &clock;
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setFlashSink(&FlashRecorder::trampoline);
+  ota.setClock(&clockRead);
+  ota.setMaxImageSize(512);
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", 4096, kImageSha,
+             insight::otaImagePath());
+
+  insight::OtaResult result = ota.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::UnsupportedSize, result.kind);
+  TEST_ASSERT_FALSE(result.retry);              // permanent refusal
+  TEST_ASSERT_EQUAL_UINT32(0u, result.retryAtMillis);
+  TEST_ASSERT_EQUAL_UINT32(0u, ota.nextAttemptAtMillis());
+  TEST_ASSERT_EQUAL_INT(0, transport.imageCount);  // never fetched
+}
+
+// A retryable-with-no-sink outcome is SCHEDULED: no flash sink means there is
+// nowhere to write, which is retryable, but it must carry a positive backoff
+// (the previous code returned retry == true with a ZERO schedule — the
+// "retryable without a deadline" hole that lets a misconfigured device
+// hot-loop). Mutation-proven: reverting to the unscheduled return turns this
+// red.
+void test_retryable_transport_failure_is_scheduled(void) {
+  ScriptedTransport transport;
+  TestClock clock;
+
+  g_clock = &clock;
+  clock.t = 500;
+
+  transport.image = g_image;
+  transport.imageLen = kImageLen;
+  std::strncpy(transport.lastImagePath, insight::otaImagePath(),
+               sizeof(transport.lastImagePath) - 1);
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setClock(&clockRead);
+  // no flash sink: TransportFailure, retryable
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  insight::OtaResult result = ota.runWithOffer(offer);
+
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::TransportFailure, result.kind);
+  TEST_ASSERT_TRUE(result.retry);
+  TEST_ASSERT_GREATER_THAN_UINT32(0u, result.retryAfterMillis);
+  TEST_ASSERT_EQUAL_UINT32(result.retryAtMillis, ota.nextAttemptAtMillis());
+  TEST_ASSERT_GREATER_OR_EQUAL_UINT32(500u + result.retryAfterMillis,
+                                      result.retryAtMillis);
+}
+
+// A schedule recorded by a PREVIOUS pass must not leak into the object's state:
+// a 429 sets nextAttemptAtMillis_; the NEXT pass (here via runWithOffer) must
+// rebuild the schedule from scratch, so a caller alternating
+// isReady()/runWithOffer() is never told "not ready" because of a deadline that
+// belonged to an earlier offer. The reset lives at the top of processOffer(),
+// which every entry point funnels through. Mutation-proven: removing that reset
+// turns this red (nextAttemptAtMillis_ lingers at the hh:mm:01 value).
+void test_run_with_offer_clears_stale_schedule(void) {
+  initImage();
+  ScriptedTransport transport;
+  FlashRecorder flash;
+  TestClock clock;
+
+  flash.bind();
+  g_clock = &clock;
+  clock.t = 1000;
+
+  // Pass 1: a 429 records a schedule.
+  transport.image = g_image;
+  transport.imageLen = kImageLen;
+  transport.imageOutcome = insight::HttpOutcome::ok(429);
+  std::strncpy(transport.lastImagePath, insight::otaImagePath(),
+               sizeof(transport.lastImagePath) - 1);
+
+  insight::InsightOta ota;
+  ota.setTransport(&transport);
+  ota.setFlashSink(&FlashRecorder::trampoline);
+  ota.setClock(&clockRead);
+
+  char offer[512];
+  buildOffer(offer, sizeof(offer), "2.0.0", kImageLen, kImageSha,
+             insight::otaImagePath());
+
+  insight::OtaResult first = ota.runWithOffer(offer);
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::RateLimited, first.kind);
+  TEST_ASSERT_GREATER_THAN_UINT32(0u, ota.nextAttemptAtMillis());
+
+  // Pass 2: a good offer, injected. The stale rate-limit schedule must be gone.
+  transport.imageOutcome = insight::HttpOutcome::ok(200);
+  insight::OtaResult second = ota.runWithOffer(offer);
+  TEST_ASSERT_EQUAL_INT(insight::OtaResult::Flashed, second.kind);
+  TEST_ASSERT_EQUAL_UINT32(0u, ota.nextAttemptAtMillis());  // cleared
+  TEST_ASSERT_EQUAL_UINT32(0u, ota.lastRetryAfterMillis());
+  TEST_ASSERT_TRUE(ota.isReady(1000));
+}
+
+// `null` must be a WHOLE token: `nullify` (or any `null`-prefixed garbage) is
+// NOT a valid "nothing to do" answer and must be refused, not read as `null`.
+// The bare-prefix match the old isNull used accepted it. Mutation-proven:
+// reverting isNull to the prefix match turns this red.
+void test_null_prefix_garbage_is_not_treated_as_null(void) {
+  insight::OtaOffer offer;
+  // `"update":nullify` is well-formed JSON syntax for a bare token that is not
+  // null; the parser must not accept it as "no update".
+  TEST_ASSERT_FALSE(insight::InsightOta::parseOffer("{\"update\":nullify}", &offer));
+  TEST_ASSERT_FALSE(offer.valid);
+  TEST_ASSERT_FALSE(offer.hasUpdate);
+
+  // The real `null`, with a following delimiter, IS accepted.
+  insight::OtaOffer ok;
+  TEST_ASSERT_TRUE(insight::InsightOta::parseOffer("{\"update\":null}", &ok));
+  TEST_ASSERT_TRUE(ok.valid);
+  TEST_ASSERT_FALSE(ok.hasUpdate);
+}
+
 int main(int, char**) {
   initImage();
 
@@ -1191,5 +1489,14 @@ int main(int, char**) {
   RUN_TEST(test_run_with_malformed_offer_does_not_flash);
   RUN_TEST(test_no_flash_sink_does_not_flash);
   RUN_TEST(test_injected_hasher_is_used);
+  // New: over-long body, mismatch diagnostics, inert record, retryability
+  RUN_TEST(test_over_long_body_is_size_mismatch_not_clamped);
+  RUN_TEST(test_hash_mismatch_carries_diagnostics);
+  RUN_TEST(test_size_mismatch_carries_diagnostics);
+  RUN_TEST(test_verification_before_first_run_is_inert);
+  RUN_TEST(test_unsupported_size_is_not_retryable);
+  RUN_TEST(test_retryable_transport_failure_is_scheduled);
+  RUN_TEST(test_run_with_offer_clears_stale_schedule);
+  RUN_TEST(test_null_prefix_garbage_is_not_treated_as_null);
   return UNITY_END();
 }

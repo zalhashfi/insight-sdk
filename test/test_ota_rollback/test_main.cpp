@@ -484,8 +484,14 @@ void test_one_millisecond_timeout_expires_per_platform(void) {
 
 // An ESP32 expiry with NO rollback seam installed must still reach a defined
 // state without calling through a null pointer. This is the "never panics on
-// the rollback path" guarantee: the transition is recorded, the absent seam is
-// simply not called, and nothing is dereferenced.
+// the rollback path" guarantee: the absent seam is simply not called, and
+// nothing is dereferenced.
+//
+// The state is `RollbackFailed`, NOT `RolledBack`. This test previously
+// expected `RolledBack` for an absent seam — behavior that (with a null seam)
+// claimed a recovery that could not have happened. `RolledBack` now means a
+// rollback that RAN AND SUCCEEDED, so an absent seam must not report it; the
+// honest answer is "recovery did not happen; reattempt".
 void test_esp32_expiry_with_null_rollback_is_safe(void) {
   InsightOtaRunner runner;
   runner.setPlatform(InsightOtaRunner::ESP32);
@@ -496,13 +502,23 @@ void test_esp32_expiry_with_null_rollback_is_safe(void) {
   advance(kTimeout);
 
   TEST_ASSERT_TRUE(runner.poll());
-  TEST_ASSERT_EQUAL_INT(InsightOtaRunner::RolledBack, runner.state());
+  TEST_ASSERT_EQUAL_INT(InsightOtaRunner::RollbackFailed, runner.state());
+  TEST_ASSERT_TRUE(runner.isRollbackFailed());
+  TEST_ASSERT_FALSE(runner.isRolledBack());   // no phantom recovery
+  TEST_ASSERT_TRUE(runner.needsReattempt());  // the caller must retry
+  TEST_ASSERT_TRUE(runner.isExpired());       // but the trial is over
   TEST_ASSERT_EQUAL_UINT32(0UL, runner.rollbackCalls());
 }
 
 // A rollback seam that itself FAILS (returns false) must not be escalated into
-// a panic or a crash: the runner has done everything it can, records the state,
-// and does not call the seam again.
+// a panic or a crash: the runner records the true outcome, and does not call the
+// seam again.
+//
+// The state is `RollbackFailed`, NOT `RolledBack`. This test previously
+// expected `RolledBack` after a FAILED rollback — i.e. it pinned the
+// false-recovery bug: a caller would read `RolledBack` ("we are back on the old
+// image") after the bootloader explicitly said the rollback did not take. The
+// state now reflects what happened; the failure is still not retried.
 void test_failing_rollback_does_not_panic_and_is_not_retried(void) {
   g_rollbackResult = false;
   InsightOtaRunner runner = makeRunner(InsightOtaRunner::ESP32, kTimeout);
@@ -510,7 +526,8 @@ void test_failing_rollback_does_not_panic_and_is_not_retried(void) {
   advance(kTimeout);
 
   TEST_ASSERT_TRUE(runner.poll());
-  TEST_ASSERT_EQUAL_INT(InsightOtaRunner::RolledBack, runner.state());
+  TEST_ASSERT_EQUAL_INT(InsightOtaRunner::RollbackFailed, runner.state());
+  TEST_ASSERT_FALSE(runner.isRolledBack());  // the rollback did NOT succeed
   TEST_ASSERT_EQUAL_INT(1, g_rollbackCalls);
 
   // Further polls do not re-drive the seam.
@@ -620,6 +637,88 @@ void test_boot_sequence_bad_update_rolls_back(void) {
   TEST_ASSERT_EQUAL_INT(1, g_rollbackCalls);
 }
 
+// A rollback that SUCCEEDS is the only path to `RolledBack`; the state is now a
+// truthful record. This is the positive control for the RollbackFailed state
+// above: same platform, same window, only the seam's return differs.
+void test_rollback_success_reaches_rolled_back(void) {
+  g_rollbackResult = true;
+  InsightOtaRunner runner = makeRunner(InsightOtaRunner::ESP32, kTimeout);
+  runner.arm();
+  advance(kTimeout);
+
+  TEST_ASSERT_TRUE(runner.poll());
+  TEST_ASSERT_EQUAL_INT(InsightOtaRunner::RolledBack, runner.state());
+  TEST_ASSERT_TRUE(runner.isRolledBack());
+  TEST_ASSERT_FALSE(runner.isRollbackFailed());
+  TEST_ASSERT_FALSE(runner.needsReattempt());  // recovery DID happen
+  TEST_ASSERT_TRUE(runner.isExpired());
+  TEST_ASSERT_EQUAL_INT(1, g_rollbackCalls);
+}
+
+// The three terminal-after-expiry states stay mutually distinct: `rolledBack`
+// (recovered), `reattemptRequired` (no slot), `rollbackFailed` (tried, failed).
+// A caller can tell them apart, which is the whole point of not collapsing them
+// into one "trial over" boolean.
+void test_expiry_states_are_mutually_distinct(void) {
+  // rolledBack: ESP32, rollback succeeds.
+  g_rollbackResult = true;
+  InsightOtaRunner ok = makeRunner(InsightOtaRunner::ESP32, kTimeout);
+  ok.arm();
+  advance(kTimeout);
+  ok.poll();
+  TEST_ASSERT_TRUE(ok.isRolledBack());
+  TEST_ASSERT_FALSE(ok.isReattemptRequired());
+  TEST_ASSERT_FALSE(ok.isRollbackFailed());
+
+  // rollbackFailed: ESP32, rollback fails.
+  resetFixture();
+  g_rollbackResult = false;
+  InsightOtaRunner failed = makeRunner(InsightOtaRunner::ESP32, kTimeout);
+  failed.arm();
+  advance(kTimeout);
+  failed.poll();
+  TEST_ASSERT_FALSE(failed.isRolledBack());
+  TEST_ASSERT_FALSE(failed.isReattemptRequired());
+  TEST_ASSERT_TRUE(failed.isRollbackFailed());
+
+  // reattemptRequired: ESP8266, no slot at all.
+  resetFixture();
+  InsightOtaRunner noSlot = makeRunner(InsightOtaRunner::ESP8266, kTimeout);
+  noSlot.arm();
+  advance(kTimeout);
+  noSlot.poll();
+  TEST_ASSERT_FALSE(noSlot.isRolledBack());
+  TEST_ASSERT_TRUE(noSlot.isReattemptRequired());
+  TEST_ASSERT_FALSE(noSlot.isRollbackFailed());
+
+  // All three are "expired" (the trial is over) but not the same state.
+  TEST_ASSERT_TRUE(ok.isExpired());
+  TEST_ASSERT_TRUE(failed.isExpired());
+  TEST_ASSERT_TRUE(noSlot.isExpired());
+}
+
+// deadlineMillis() wraps WITH the clock rather than saturating: armed 1000 ms
+// before the wrap with a 5000 ms window, the deadline is a wrapped reading that
+// still agrees with the modular `elapsedMillis()` the runner uses. A saturated
+// deadline would sit above the wrapped clock and never be reached, so the trial
+// could never expire — this pins the in-domain (modular) answer.
+void test_deadline_wraps_with_the_clock(void) {
+  g_now = 0xFFFFFFFFUL - 1000UL;
+  InsightOtaRunner runner = makeRunner(InsightOtaRunner::ESP32, kTimeout);
+  runner.arm();
+
+  // 0xFFFFFFFF-1000 + 5000, modulo 2^32 — the same value elapsed() measures
+  // against. It is NOT saturated, so it wraps through zero.
+  const unsigned long expected = (0xFFFFFFFFUL - 1000UL) + kTimeout;
+  TEST_ASSERT_EQUAL_UINT32(expected, runner.deadlineMillis());
+  TEST_ASSERT_TRUE(expected < runner.armedAtMillis());  // it wrapped
+
+  // And the trial does expire: crossing the wrap reaches the deadline.
+  advance(kTimeout);
+  TEST_ASSERT_TRUE(runner.poll());
+  TEST_ASSERT_EQUAL_INT(InsightOtaRunner::RolledBack, runner.state());
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
 
@@ -661,6 +760,11 @@ int main(int, char**) {
   // Representative boot sequences
   RUN_TEST(test_boot_sequence_successful_update);
   RUN_TEST(test_boot_sequence_bad_update_rolls_back);
+
+  // Rollback outcome integrity (the RollbackFailed state)
+  RUN_TEST(test_rollback_success_reaches_rolled_back);
+  RUN_TEST(test_expiry_states_are_mutually_distinct);
+  RUN_TEST(test_deadline_wraps_with_the_clock);
 
   return UNITY_END();
 }

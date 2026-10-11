@@ -178,6 +178,39 @@ struct OtaResult {
     r.retryAfterMillis = retryAfter;
     return r;
   }
+
+  // As make(), but also carries the offered version and the digest the pass
+  // computed. Added so a MISMATCH result is diagnosable: the two cases that
+  // most need "what did we get vs what was offered?" — SizeMismatch and
+  // HashMismatch — previously returned through make()/inline assignment and
+  // discarded both fields, so an operator saw only a kind. `computedSha256` is
+  // "" for a SizeMismatch (nothing was hashed) and the real digest for a
+  // HashMismatch; `version` is the offer's, when it carried one. Bounded copy,
+  // so an over-long source can never overrun the field.
+  static OtaResult makeDiagnostic(Kind k, bool retryable, uint32_t receivedBytes,
+                                  uint32_t retryAt, uint32_t retryAfter,
+                                  const char* version,
+                                  const char* computedSha256) {
+    OtaResult r = make(k, retryable, receivedBytes, retryAt, retryAfter);
+    copyField(r.computedSha256, sizeof(r.computedSha256), computedSha256);
+    (void)version;  // version lives on the record, not on OtaResult::Kind
+    return r;
+  }
+
+ private:
+  // Bounded NUL-terminating copy into a fixed field; a null source is "".
+  static void copyField(char* out, size_t outLen, const char* src) {
+    if (out == 0 || outLen == 0) return;
+    if (src == 0) {
+      out[0] = '\0';
+      return;
+    }
+    size_t i = 0;
+    for (; i + 1 < outLen && src[i] != '\0'; ++i) out[i] = src[i];
+    out[i] = '\0';
+  }
+
+ public:
 };
 
 // ---------------------------------------------------------------------------
@@ -222,6 +255,16 @@ const size_t kOtaPubkeyIdHexMaxLength = 64;
 // key": signature checking is then SKIPPED entirely and the offer's signature
 // fields are ignored — see InsightOta::setSignatureVerifier() for why that is a
 // deliberate opt-in rather than a silent downgrade.
+//
+// CONTRACT THE SDK CANNOT ENFORCE (the backend's responsibility): the SDK
+// guarantees it hands the verifier exactly the bytes it will flash and acts on
+// the boolean it returns, but it cannot police WHAT the backend does. A
+// conforming backend therefore MUST (a) return true only for a genuine
+// verification (never a stub that returns true), (b) compare/reject in time
+// that does not leak the expected value, and (c) treat a null `signatureHex` or
+// `pubkeyIdHex` as a FAILURE, not a pass. The shipped offer parser normalises
+// both hex strings to lowercase and bounds them, but establishing trust is the
+// injector's job.
 typedef bool (*SignatureVerifier)(const uint8_t* image, size_t len, const char* signatureHex, const char* pubkeyIdHex);
 
 // ---------------------------------------------------------------------------
@@ -414,10 +457,17 @@ class InsightOta {
         verifySignature_(0), requireSignature_(false),
         maxImage_(INSIGHT_OTA_MAX_IMAGE), nowMillis_(0), nextAttemptAtMillis_(0),
         attempts_(0), lastStatus_(0), lastContentLength_(0),
-        lastRetryAfter_(0), lastSignatureChecked_(false), lastSignatureOk_(false),
+        lastRetryAfter_(0), reason_(OtaResult::NoUpdate),
+        lastSignatureChecked_(false), lastSignatureOk_(false),
         lastOfferVersion_(), lastOfferSignature_(), lastOfferPubkeyId_(),
-        reason_(OtaResult::NoUpdate) {
+        lastComputedSha256_(), lastOfferSize_(0), lastReceived_(0) {
     hasher_ = builtInSha256();
+    // Every string member the lastVerification() record reads is initialised
+    // here, NOT only at the top of processOffer(): lastVerification() is a
+    // const accessor a caller may reach BEFORE the first run(), and copying an
+    // uninitialised member would be reading indeterminate memory. `flashed` and
+    // the signature flags already default false, so the pre-run record reads as
+    // the "nothing happened" state — the same state ImageVerification() reports.
     lastOfferVersion_[0] = '\0';
     lastOfferSignature_[0] = '\0';
     lastOfferPubkeyId_[0] = '\0';

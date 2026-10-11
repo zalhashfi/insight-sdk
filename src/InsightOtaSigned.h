@@ -197,6 +197,14 @@ struct RollbackOutcome {
     // and cannot be undone; the operator must reattempt. Terminal in the sense
     // that THIS decision is final, but distinct from RolledBack by design.
     ReattemptRequired,
+    // The health-check said the device did not reach the expected image, the
+    // platform CAN roll back (ESP32), but the rollback itself FAILED (the
+    // bootloader reported false, or no rollback seam is wired). The device is
+    // NOT back on a known-good image, so — like ReattemptRequired — the caller
+    // must reattempt, and `rolledBack` stays FALSE. Kept distinct from
+    // ReattemptRequired so an operator can tell "this chip has no rollback"
+    // from "the rollback was attempted and did not take".
+    RollbackFailed,
     // The health-check did not complete (offline/5xx/no seam). The trial stays
     // on probation and the CALLER must retry the check; nothing was confirmed
     // and nothing was rolled back. Not terminal.
@@ -218,6 +226,12 @@ struct RollbackOutcome {
   // True only for ReattemptRequired — the ESP8266 "the update is stuck, retry"
   // outcome. Mutually exclusive with `rolledBack`.
   bool reattemptRequired;
+  // True when the trial ended without a successful recovery, so the caller must
+  // reattempt the update. True for BOTH ReattemptRequired (no rollback exists)
+  // and RollbackFailed (rollback was attempted and failed); false for Kept,
+  // RolledBack, KeepTrial and NoTrial. Provided so a caller can log/schedule the
+  // retry without conflating a failed rollback with a successful one.
+  bool retryRecommended;
   // True when the runner actually expired a trial as a result of this call
   // (i.e. the trial was still pending when a terminal verdict arrived).
   bool trialExpired;
@@ -225,7 +239,7 @@ struct RollbackOutcome {
   // Construct a "no trial, nothing decided" outcome.
   RollbackOutcome()
       : decision(NoTrial), verdict(HealthUnknown), rolledBack(false),
-        reattemptRequired(false), trialExpired(false) {}
+        reattemptRequired(false), retryRecommended(false), trialExpired(false) {}
 };
 
 // ===========================================================================
@@ -250,7 +264,9 @@ class HealthCheckRollback {
  public:
   HealthCheckRollback()
       : runner_(0), report_(0), checks_(0), lastVerdict_(HealthUnknown),
-        lastRolledBack_(false), lastReattempt_(false) {}
+        lastRolledBack_(false), lastReattempt_(false),
+        lastRollbackFailed_(false),
+        nextAllowedMillis_(0), unknownStreak_(0), lastBackoffMillis_(0) {}
 
   // Borrow a runner and install the health-check seam. Either may be null:
   // a null runner makes every check() a `NoTrial` no-op, and a null report_
@@ -258,7 +274,9 @@ class HealthCheckRollback {
   // rolled back on a check that did not happen).
   HealthCheckRollback(InsightOtaRunner* runner, HealthReport report)
       : runner_(runner), report_(report), checks_(0), lastVerdict_(HealthUnknown),
-        lastRolledBack_(false), lastReattempt_(false) {}
+        lastRolledBack_(false), lastReattempt_(false),
+        lastRollbackFailed_(false),
+        nextAllowedMillis_(0), unknownStreak_(0), lastBackoffMillis_(0) {}
 
   // --- injected seams ----------------------------------------------------
   void setRunner(InsightOtaRunner* runner) { runner_ = runner; }
@@ -281,6 +299,34 @@ class HealthCheckRollback {
     return runner_ != 0 && runner_->isTrial();
   }
 
+  // --- Unknown-verdict backoff (never hammer the reconcile) --------------
+  //
+  // An `Unknown` verdict is not a decision: the trial stays on probation and
+  // the caller retries. Retrying IMMEDIATELY from loop() would hammer the very
+  // server that is already failing, so an Unknown verdict records a bounded
+  // backoff and the caller waits for it. This mirrors InsightOta's own
+  // retry-after/backoff policy: the wait is RECORDED, never slept on.
+  //
+  // The delay is the shared bounded exponential backoff from InsightReliability
+  // (already included through InsightOta.h), keyed on the number of CONSECUTIVE
+  // Unknown verdicts, so a longer outage backs off further instead of settling
+  // into a fixed-rate poll. A Healthy/Unhealthy verdict or a dropped trial
+  // resets the counter, so a single transient Unknown does not penalise the
+  // step after it.
+
+  // millis() at or after which the next health-check may run, in the runner's
+  // clock domain, or 0 when none is pending (a decision was reached, or no
+  // check has run). The caller loops with
+  //   if (roller.isReady(millis())) roller.check();
+  uint32_t nextAllowedMillis() const { return nextAllowedMillis_; }
+
+  // True when a check may run at `nowMillis`: no pending schedule, or the
+  // schedule has been reached. With no pending backoff the answer is true, so a
+  // caller can drive this unconditionally from loop().
+  bool isReady(uint32_t nowMillis) const {
+    return nextAllowedMillis_ == 0 || nowMillis >= nextAllowedMillis_;
+  }
+
   // Run the health-check ONCE and act on its verdict. Bounded and non-blocking:
   // it makes at most one `report_()` call and reads the clock only through the
   // runner. Returns the decision as a value; every field is also latched into
@@ -291,21 +337,27 @@ class HealthCheckRollback {
   //   Healthy   -> runner_->confirm()  -> Kept        (ESP32 and ESP8266 alike;
   //                                       a healthy device is healthy on both)
   //   Unhealthy -> trip the trial and let the RUNNER decide:
-  //                  ESP32   -> RolledBack (rollback() invoked once)
-  //                  ESP8266 -> ReattemptRequired (rollback() NEVER invoked)
+  //                  ESP32, rollback ok      -> RolledBack
+  //                  ESP32, rollback FAILED  -> RollbackFailed
+  //                  ESP8266 (no slot)       -> ReattemptRequired
   //                The platform branch is NOT re-implemented here. The runner
   //                performs it through its own expiry path, so there is exactly
   //                one place that knows ESP32 has two slots and ESP8266 does
   //                not — which is what keeps the two from drifting apart.
   //   Unknown   -> nothing happens; the trial stays on probation (KeepTrial)
-  //                and the caller retries. An unreachable server is not
-  //                evidence of a bad image.
+  //                and the caller retries AFTER a bounded backoff. An
+  //                unreachable server is not evidence of a bad image and must
+  //                not be hammered.
   RollbackOutcome check() {
     RollbackOutcome out;
     out.decision = RollbackOutcome::NoTrial;
     out.verdict = HealthUnknown;
     if (runner_ == 0 || !runner_->isTrial()) {
       lastVerdict_ = HealthUnknown;
+      // No trial: any backoff is over, so a caller cannot be left waiting on a
+      // schedule that belonged to a trial that has since ended.
+      nextAllowedMillis_ = 0;
+      unknownStreak_ = 0;
       return out;
     }
 
@@ -323,6 +375,8 @@ class HealthCheckRollback {
         runner_->confirm();
         out.decision = RollbackOutcome::Kept;
         out.trialExpired = false;
+        nextAllowedMillis_ = 0;   // decided: no retry pending
+        unknownStreak_ = 0;
         break;
 
       case HealthUnhealthy: {
@@ -336,15 +390,31 @@ class HealthCheckRollback {
         if (runner_->isRolledBack()) {
           out.decision = RollbackOutcome::RolledBack;
           out.rolledBack = true;
+        } else if (runner_->isRollbackFailed()) {
+          // ESP32: the rollback was attempted and did NOT take. The device is
+          // not on a known-good image; the caller must reattempt. Explicitly
+          // not `rolledBack`, so no successful-recovery claim is ever made.
+          out.decision = RollbackOutcome::RollbackFailed;
+          out.retryRecommended = true;
         } else if (runner_->isReattemptRequired()) {
           out.decision = RollbackOutcome::ReattemptRequired;
           out.reattemptRequired = true;
+          out.retryRecommended = true;
         } else {
           // The runner did not reach a terminal state (e.g. its clock is frozen
           // or the deadline is in the future). We cannot honestly claim either
           // recovery happened, so the trial stays pending and the caller
-          // retries — fail safe, never a phantom rollback.
+          // retries — fail safe, never a phantom rollback. Back off before the
+          // retry, exactly as for an Unknown verdict, so a frozen-clock device
+          // cannot spin.
           out.decision = RollbackOutcome::KeepTrial;
+          scheduleUnknownBackoff();
+        }
+        // A terminal verdict ends the backoff question entirely: there is no
+        // trial left to re-check.
+        if (out.decision != RollbackOutcome::KeepTrial) {
+          nextAllowedMillis_ = 0;
+          unknownStreak_ = 0;
         }
         break;
       }
@@ -353,14 +423,18 @@ class HealthCheckRollback {
       default:
         // No verdict -> no action. NOT a rollback (a server outage must not
         // brick a healthy device by rolling it back) and NOT a confirm (we
-        // cannot vouch for an image we could not check).
+        // cannot vouch for an image we could not check). The caller retries,
+        // but only AFTER a bounded backoff so loop() cannot hammer a server
+        // that is already failing.
         out.decision = RollbackOutcome::KeepTrial;
         out.trialExpired = false;
+        scheduleUnknownBackoff();
         break;
     }
 
     lastRolledBack_ = out.rolledBack;
     lastReattempt_ = out.reattemptRequired;
+    lastRollbackFailed_ = (out.decision == RollbackOutcome::RollbackFailed);
     return out;
   }
 
@@ -377,14 +451,51 @@ class HealthCheckRollback {
   HealthVerdict lastVerdict() const { return lastVerdict_; }
   bool lastRolledBack() const { return lastRolledBack_; }
   bool lastReattemptRequired() const { return lastReattempt_; }
+  // The last check ended in an ESP32 rollback that FAILED (the device is not
+  // back on a known-good image). Distinct from lastRolledBack(), which is only
+  // ever true for a rollback that SUCCEEDED.
+  bool lastRollbackFailed() const { return lastRollbackFailed_; }
+
+  // Duration the last non-decisive verdict scheduled before the next check, in
+  // millis (0 when nothing was scheduled). Exposed so a test asserts the
+  // SCHEDULE rather than observing a sleep — this layer never blocks.
+  uint32_t lastBackoffMillis() const { return lastBackoffMillis_; }
+
+  // Number of CONSECUTIVE non-decisive (Unknown / stuck-KeepTrial) verdicts,
+  // which drives the exponential backoff. Reset to 0 by any decision.
+  uint32_t unknownStreak() const { return unknownStreak_; }
 
  private:
+  // Record a bounded backoff for the NEXT health-check after a non-decisive
+  // verdict (Unknown, or an Unhealthy that could not trip a terminal state).
+  // The delay is the shared bounded exponential backoff keyed on the number of
+  // CONSECUTIVE such verdicts — the same policy InsightOta uses for a transport
+  // failure — so a longer outage polls less often instead of at a fixed rate.
+  // The deadline is in the RUNNER's clock domain (the only clock this layer can
+  // read); a null runner clock reads as 0, which makes the deadline unobservable
+  // but never wrong.
+  void scheduleUnknownBackoff() {
+    ++unknownStreak_;
+    const uint32_t now = runner_ != 0 ? static_cast<uint32_t>(runner_->now()) : 0u;
+    const uint32_t wait = backoffMillis(unknownStreak_ - 1u);
+    nextAllowedMillis_ = now + wait;
+    lastBackoffMillis_ = wait;
+  }
+
   InsightOtaRunner* runner_;
   HealthReport report_;
   unsigned long checks_;
   HealthVerdict lastVerdict_;
   bool lastRolledBack_;
   bool lastReattempt_;
+  bool lastRollbackFailed_;
+
+  // Unknown-verdict backoff state. `unknownStreak_` counts CONSECUTIVE
+  // non-decisive verdicts and resets on any decision or on a dropped trial;
+  // `nextAllowedMillis_` is in the runner's clock domain (0 == no wait).
+  uint32_t nextAllowedMillis_;
+  uint32_t unknownStreak_;
+  uint32_t lastBackoffMillis_;
 };
 
 // ===========================================================================

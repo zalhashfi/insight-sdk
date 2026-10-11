@@ -465,6 +465,72 @@ void test_wrapped_ring_iterates_in_order(void) {
   TEST_ASSERT_EQUAL_INT(1, static_cast<int>(b.dropped()));
 }
 
+// removeAt(): removing a middle entry shifts the later entries down and keeps
+// FIFO order (this is the O(1)-stack removal the send policy relies on).
+void test_remove_at_shifts_and_keeps_order(void) {
+  insight::InsightBuffer b;
+  b.setBufferSize(4);
+  b.push("a", 1.0f);
+  b.push("b", 2.0f);
+  b.push("c", 3.0f);
+  b.push("d", 4.0f);
+
+  TEST_ASSERT_TRUE(b.removeAt(1));  // drop "b"
+  TEST_ASSERT_EQUAL_INT(3, static_cast<int>(b.size()));
+  TEST_ASSERT_EQUAL_STRING("a", b.oldest().key);
+  TEST_ASSERT_EQUAL_STRING("d", b.newest().key);
+  insight::BufferEntryView v;
+  b.at(0, &v);
+  TEST_ASSERT_EQUAL_STRING("a", v.key);
+  b.at(1, &v);
+  TEST_ASSERT_EQUAL_STRING("c", v.key);
+  b.at(2, &v);
+  TEST_ASSERT_EQUAL_STRING("d", v.key);
+  // Values move with the keys.
+  b.at(1, &v);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 3.0f, v.value);
+}
+
+// removeAt() on the last entry is a pop, and on a wrapped ring it must still
+// re-linearise correctly.
+void test_remove_at_last_and_on_wrapped_ring(void) {
+  insight::InsightBuffer b;
+  b.setBufferSize(3);
+  b.push("a", 1.0f);
+  b.push("b", 2.0f);
+  b.push("c", 3.0f);
+  b.push("d", 4.0f);  // evicts a; head wraps
+
+  // Remove the newest ("d") — a plain pop.
+  TEST_ASSERT_TRUE(b.removeAt(2));
+  TEST_ASSERT_EQUAL_INT(2, static_cast<int>(b.size()));
+  TEST_ASSERT_EQUAL_STRING("b", b.oldest().key);
+  TEST_ASSERT_EQUAL_STRING("c", b.newest().key);
+
+  // Remove the oldest ("b") — shifts c down.
+  TEST_ASSERT_TRUE(b.removeAt(0));
+  TEST_ASSERT_EQUAL_INT(1, static_cast<int>(b.size()));
+  TEST_ASSERT_EQUAL_STRING("c", b.oldest().key);
+
+  // Emptying the last entry resets the head.
+  TEST_ASSERT_TRUE(b.removeAt(0));
+  TEST_ASSERT_EQUAL_INT(0, static_cast<int>(b.size()));
+  // The buffer still accepts and orders fresh pushes after being emptied.
+  b.push("z", 9.0f);
+  TEST_ASSERT_EQUAL_STRING("z", b.oldest().key);
+}
+
+// removeAt() out of range is a safe no-op (returns false, changes nothing) and a
+// null/disabled buffer never crashes.
+void test_remove_at_out_of_range_is_noop(void) {
+  insight::InsightBuffer b;
+  b.setBufferSize(2);
+  b.push("a", 1.0f);
+  TEST_ASSERT_FALSE(b.removeAt(5));
+  TEST_ASSERT_EQUAL_INT(1, static_cast<int>(b.size()));
+  TEST_ASSERT_EQUAL_STRING("a", b.oldest().key);
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_default_capacity_is_200);
@@ -489,5 +555,8 @@ int main(int, char**) {
   RUN_TEST(test_clear_empties_without_touching_counters);
   RUN_TEST(test_get_reports_absent_keys);
   RUN_TEST(test_wrapped_ring_iterates_in_order);
+  RUN_TEST(test_remove_at_shifts_and_keeps_order);
+  RUN_TEST(test_remove_at_last_and_on_wrapped_ring);
+  RUN_TEST(test_remove_at_out_of_range_is_noop);
   return UNITY_END();
 }

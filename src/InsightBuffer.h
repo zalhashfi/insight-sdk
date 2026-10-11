@@ -225,6 +225,27 @@ class InsightBuffer {
     head_ = 0;
   }
 
+  // Remove the entry at logical `index` (0-based, oldest first) and shift every
+  // later entry down one position, preserving FIFO order. Returns false when
+  // `index` is out of range or buffering is disabled. Removing the last entry is
+  // a plain pop; removing a middle entry shifts the tail.
+  //
+  // This is the O(1)-stack removal the send policy needs to drop a single
+  // already-sent entry (the caller no longer has to snapshot the whole queue
+  // onto the stack and re-push it). The shift is done slot-by-slot with
+  // `copyEntry`, which moves a fixed-size slot, so no temporary sized to the
+  // queue is ever allocated.
+  bool removeAt(size_t index) {
+    if (index >= size_) return false;
+    // Shift entries index+1 .. size_-1 down by one logical position.
+    for (size_t i = index; i + 1 < size_; ++i) {
+      copyEntry(slotAt(i), slotAt(i + 1));
+    }
+    --size_;
+    if (size_ == 0) head_ = 0;
+    return true;
+  }
+
  private:
   // Largest capacity setBufferSize() honours (see INSIGHT_BUFFER_CAP).
   static const size_t kMaxCapacity = INSIGHT_BUFFER_CAP;

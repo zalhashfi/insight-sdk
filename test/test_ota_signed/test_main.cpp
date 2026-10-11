@@ -543,6 +543,117 @@ void test_boot_sequence_healthy_vs_unhealthy(void) {
   }
 }
 
+// An ESP32 rollback that FAILS surfaces as RollbackFailed, NOT RolledBack, and
+// does not claim a recovery. Previously a failed rollback was reported as
+// RolledBack — the false-recovery the RollbackFailed state exists to remove.
+// The decision carries retryRecommended so the caller knows to reattempt without
+// ever reading `rolledBack == true`.
+void test_esp32_failed_rollback_is_not_reported_as_recovered(void) {
+  Rig rig = makeRig(InsightOtaRunner::ESP32);
+  rig.runner.arm();
+  g_rollbackResult = false;  // the bootloader refuses to roll back
+  g_healthToReport = HealthCheck::unhealthy("1.0.0", "2.0.0");
+
+  RollbackOutcome out = rig.roller.check();
+
+  TEST_ASSERT_EQUAL_INT(RollbackOutcome::RollbackFailed, out.decision);
+  TEST_ASSERT_FALSE(out.rolledBack);        // NOT a successful recovery
+  TEST_ASSERT_FALSE(out.reattemptRequired); // distinct from the ESP8266 case
+  TEST_ASSERT_TRUE(out.retryRecommended);   // the caller must reattempt
+  TEST_ASSERT_TRUE(rig.runner.isRollbackFailed());
+  TEST_ASSERT_FALSE(rig.runner.isRolledBack());
+  TEST_ASSERT_EQUAL_INT(1, g_rollbackCalls);
+  TEST_ASSERT_EQUAL_INT(0, g_markValidCalls);
+
+  // The roller latches the same fact.
+  TEST_ASSERT_TRUE(rig.roller.lastRollbackFailed());
+  TEST_ASSERT_FALSE(rig.roller.lastRolledBack());
+}
+
+// A successful ESP32 rollback still reports RolledBack and NOT retry — the
+// positive control for the failed-rollback case above.
+void test_esp32_successful_rollback_reports_recovered(void) {
+  Rig rig = makeRig(InsightOtaRunner::ESP32);
+  rig.runner.arm();
+  g_rollbackResult = true;
+  g_healthToReport = HealthCheck::unhealthy("1.0.0", "2.0.0");
+
+  RollbackOutcome out = rig.roller.check();
+
+  TEST_ASSERT_EQUAL_INT(RollbackOutcome::RolledBack, out.decision);
+  TEST_ASSERT_TRUE(out.rolledBack);
+  TEST_ASSERT_FALSE(out.retryRecommended);
+  TEST_ASSERT_TRUE(rig.runner.isRolledBack());
+  TEST_ASSERT_FALSE(rig.roller.lastRollbackFailed());
+}
+
+// An ESP8266 unhealthy check reports ReattemptRequired with retryRecommended but
+// NOT rolledBack — and, crucially, is a DIFFERENT decision from RollbackFailed
+// (ESP32's tried-and-failed). The two are kept apart so an operator can tell a
+// chip with no rollback from a rollback that did not take.
+void test_esp8266_reattempt_is_distinct_from_rollback_failed(void) {
+  Rig rig = makeRig(InsightOtaRunner::ESP8266);
+  rig.runner.arm();
+  g_healthToReport = HealthCheck::unhealthy("1.0.0", "2.0.0");
+
+  RollbackOutcome out = rig.roller.check();
+
+  TEST_ASSERT_EQUAL_INT(RollbackOutcome::ReattemptRequired, out.decision);
+  TEST_ASSERT_TRUE(out.reattemptRequired);
+  TEST_ASSERT_FALSE(out.rolledBack);
+  TEST_ASSERT_TRUE(out.retryRecommended);
+  TEST_ASSERT_EQUAL_INT(0, g_rollbackCalls);  // no rollback attempted
+  TEST_ASSERT_TRUE(RollbackOutcome::ReattemptRequired !=
+                   RollbackOutcome::RollbackFailed);
+}
+
+// An Unknown verdict schedules a bounded backoff: the caller must NOT re-check
+// immediately (which would hammer an already-failing server). The schedule is
+// read through isReady()/nextAllowedMillis(); as the outage continues the streak
+// grows and — with the shared bounded backoff — the delay never shrinks below
+// the first step. A healthy verdict clears the schedule.
+void test_unknown_verdict_backs_off_before_rechecking(void) {
+  Rig rig = makeRig(InsightOtaRunner::ESP32);
+  rig.runner.arm();
+
+  g_healthToReport = HealthCheck::unknown();
+  RollbackOutcome first = rig.roller.check();
+  TEST_ASSERT_EQUAL_INT(RollbackOutcome::KeepTrial, first.decision);
+  TEST_ASSERT_TRUE(rig.runner.isTrial());
+
+  // A schedule was recorded, and the roller is NOT ready at the instant of the
+  // verdict.
+  const uint32_t scheduled = rig.roller.nextAllowedMillis();
+  TEST_ASSERT_TRUE(scheduled != 0);
+  TEST_ASSERT_GREATER_THAN_UINT32(static_cast<uint32_t>(g_now), scheduled);
+  TEST_ASSERT_FALSE(rig.roller.isReady(static_cast<uint32_t>(g_now)));
+  TEST_ASSERT_TRUE(rig.roller.isReady(scheduled));
+  TEST_ASSERT_EQUAL_UINT32(1u, rig.roller.unknownStreak());
+  TEST_ASSERT_GREATER_THAN_UINT32(0u, rig.roller.lastBackoffMillis());
+
+  // A healthy verdict after the outage clears the schedule and confirms.
+  advance(scheduled - static_cast<uint32_t>(g_now));
+  g_healthToReport = HealthCheck::healthy("2.0.0", "2.0.0");
+  TEST_ASSERT_EQUAL_INT(RollbackOutcome::Kept, rig.roller.check().decision);
+  TEST_ASSERT_EQUAL_UINT32(0u, rig.roller.nextAllowedMillis());  // cleared
+  TEST_ASSERT_TRUE(rig.roller.isReady(static_cast<uint32_t>(g_now)));
+  TEST_ASSERT_EQUAL_UINT32(0u, rig.roller.unknownStreak());
+}
+
+// The missing-health-seam case is Unknown too, and therefore also backed off —
+// "there is no way to check" must not become a busy loop any more than a live
+// outage does.
+void test_missing_health_seam_also_backs_off(void) {
+  InsightOtaRunner runner = makeRunner(InsightOtaRunner::ESP32);
+  HealthCheckRollback roller;  // no report_ installed
+  roller.setRunner(&runner);
+  runner.arm();
+
+  TEST_ASSERT_EQUAL_INT(RollbackOutcome::KeepTrial, roller.check().decision);
+  TEST_ASSERT_TRUE(roller.nextAllowedMillis() != 0);
+  TEST_ASSERT_FALSE(roller.isReady(static_cast<uint32_t>(g_now)));
+}
+
 // ===========================================================================
 // Acceptance 3: wrong signature -> NO flash;  correct signature -> flash
 // ===========================================================================
@@ -1018,6 +1129,13 @@ int main(int, char**) {
   RUN_TEST(test_null_runner_is_safe);
   RUN_TEST(test_failed_check_is_not_reapplied);
   RUN_TEST(test_boot_sequence_healthy_vs_unhealthy);
+
+  // Rollback outcome integrity + Unknown backoff (B14 hardening)
+  RUN_TEST(test_esp32_failed_rollback_is_not_reported_as_recovered);
+  RUN_TEST(test_esp32_successful_rollback_reports_recovered);
+  RUN_TEST(test_esp8266_reattempt_is_distinct_from_rollback_failed);
+  RUN_TEST(test_unknown_verdict_backs_off_before_rechecking);
+  RUN_TEST(test_missing_health_seam_also_backs_off);
 
   // Acceptance 3: wrong signature -> no flash; correct -> flash
   RUN_TEST(test_offer_parses_signature_and_key_id);

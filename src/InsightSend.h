@@ -291,40 +291,18 @@ class InsightSend {
     // deadline visible for the caller.
   }
 
-  // Remove buffer entry `index` using only the buffer's public seam: snapshot
-  // every entry except that one, clear, then re-push them in order. Bounded by
-  // the queue size and free of any time wait.
+  // Remove buffer entry `index` via the buffer's own logical removal, WITHOUT a
+  // whole-queue stack snapshot. The previous implementation copied every
+  // surviving entry into local arrays sized to the ceiling
+  // (INSIGHT_SEND_STATE_SLOTS x (KEY_MAX+1) bytes) — several KB of stack, which
+  // is a large fraction of the ESP8266's small loop-task stack and would
+  // overflow it. `InsightBuffer::removeAt` does the shift slot-by-slot with a
+  // fixed-size frame, so this stays O(1) stack. Returns whether an entry was
+  // removed, which the caller does not need (it re-reads size()), so the result
+  // is intentionally ignored.
   void dropBufferEntryAt(size_t index) {
     if (buffer_ == 0) return;
-    const size_t n = buffer_->size();
-    if (index >= n) return;
-
-    // Snapshot every field before mutating: a borrow dies on the first push().
-    char keys_[INSIGHT_SEND_STATE_SLOTS][INSIGHT_BUFFER_KEY_MAX + 1];
-    float values_[INSIGHT_SEND_STATE_SLOTS];
-    bool nulls_[INSIGHT_SEND_STATE_SLOTS];
-    size_t kept = 0;
-    for (size_t k = 0; k < n && kept < kSlots; ++k) {
-      if (k == index) continue;
-      BufferEntryView v;
-      if (!buffer_->at(k, &v)) break;
-      size_t len = v.keyLen;
-      if (len > INSIGHT_BUFFER_KEY_MAX) len = INSIGHT_BUFFER_KEY_MAX;
-      for (size_t c = 0; c < len; ++c) keys_[kept][c] = v.key[c];
-      keys_[kept][len] = '\0';
-      values_[kept] = v.value;
-      nulls_[kept] = v.null;
-      ++kept;
-    }
-
-    buffer_->clear();
-    for (size_t k = 0; k < kept; ++k) {
-      if (nulls_[k]) {
-        buffer_->push(keys_[k], MetricValue::null());
-      } else {
-        buffer_->push(keys_[k], values_[k]);
-      }
-    }
+    buffer_->removeAt(index);
   }
 
   // Align the mirror with the buffer's current size. Keeps the invariant

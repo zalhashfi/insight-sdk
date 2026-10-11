@@ -189,18 +189,45 @@ const char* skipWs(const char* p) {
   return p;
 }
 
-// Find `"name"` as a complete key at or after `from`; returns a pointer just
-// past the closing quote of the key, or 0. A key must be preceded by `{` or a
+// Find `"name"` as a complete key at or after `from`; returns a pointer to the
+// VALUE (having consumed the `:`), or 0. A key must be preceded by `{` or a
 // `,` (after optional whitespace) so a field name can never be matched inside
 // a string VALUE — e.g. the `"size"` inside a version string must not be read
-// as the size field. This is deliberately a structural-lite scan, not a full
-// JSON parser (the SDK carries no JSON library, by design).
+// as the size field.
+//
+// The scan is STRING-AWARE: it tracks in-string/in-escape state so a `,` or a
+// key-shaped run of bytes INSIDE a string value can never be mistaken for the
+// object's own punctuation. Without that, a value such as
+// `"x, \"size\": 9999"` would let the `,` inside the quoted value start a
+// phantom field match — a value the wire controls, so the guard matters. This
+// is deliberately a structural-lite scan, not a full JSON parser (the SDK
+// carries no JSON library, by design), but it is string-correct for the part it
+// does parse.
 const char* findField(const char* from, const char* name) {
   if (from == 0 || name == 0) return 0;
   const size_t nameLen = std::strlen(name);
+  bool inString = false;
+  bool escaped = false;
   const char* p = from;
   while (*p != '\0') {
-    if (*p == '{' || *p == ',') {
+    const char ch = *p;
+    if (inString) {
+      if (escaped) {
+        escaped = false;  // this byte is escaped; never structural
+      } else if (ch == '\\') {
+        escaped = true;
+      } else if (ch == '"') {
+        inString = false;
+      }
+      ++p;
+      continue;
+    }
+    if (ch == '"') {
+      inString = true;
+      ++p;
+      continue;
+    }
+    if (ch == '{' || ch == ',') {
       const char* q = skipWs(p + 1);
       if (*q == '"' && std::strncmp(q + 1, name, nameLen) == 0 &&
           q[1 + nameLen] == '"') {
@@ -214,15 +241,32 @@ const char* findField(const char* from, const char* name) {
   return 0;
 }
 
-// True when `p` begins the literal `null`.
-bool isNull(const char* p) { return p != 0 && std::strncmp(p, "null", 4) == 0; }
+// True when `p` begins the literal `null` AS A WHOLE TOKEN — the four bytes
+// `null` followed by a JSON delimiter (whitespace, `,`, `}` or `]`) or the end
+// of input. A bare prefix match would accept `nullify`/`nullptr`/`nullx` as
+// `null`, so a malformed update value could be read as a well-formed
+// "nothing to do"; the delimiter requirement makes the match exact.
+bool isNull(const char* p) {
+  if (p == 0 || std::strncmp(p, "null", 4) != 0) return false;
+  const char c = p[4];
+  return c == '\0' || c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+         c == ',' || c == '}' || c == ']';
+}
 
 // Parse a JSON string starting at the opening quote into `out` (capacity
-// `outLen`, always NUL-terminated). Handles the `\"` and `\\` escapes; other
-// escapes are copied as the following byte (enough for versions/URLs/digests).
+// `outLen`, always NUL-terminated). Handles the standard JSON escapes
+// (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`; `\uXXXX` is copied as its
+// four hex digits, which is enough for the identifiers this parser reads).
 // Returns a pointer past the closing quote, or 0 on a malformed string.
+//
+// A value longer than `outLen` is REFUSED (returns 0), never silently
+// truncated: a truncated digest, URL or version would then be compared against
+// a different value and the mismatch would surface somewhere confusing rather
+// than as a parse failure at the point the garbage arrived. (A truncated
+// signature was the sharpest case: silently shortening a security field is
+// exactly the downgrade the offer parser must not perform.)
 const char* parseString(const char* p, char* out, size_t outLen) {
-  if (p == 0 || *p != '"' || outLen == 0) return 0;
+  if (p == 0 || *p != '"' || out == 0 || outLen == 0) return 0;
   ++p;
   size_t n = 0;
   while (*p != '\0' && *p != '"') {
@@ -230,12 +274,25 @@ const char* parseString(const char* p, char* out, size_t outLen) {
     if (ch == '\\') {
       const char next = *(p + 1);
       if (next == '\0') return 0;
-      ch = (next == '"' || next == '\\' || next == '/') ? next : next;
+      switch (next) {
+        case '"': ch = '"'; break;
+        case '\\': ch = '\\'; break;
+        case '/': ch = '/'; break;
+        case 'b': ch = '\b'; break;
+        case 'f': ch = '\f'; break;
+        case 'n': ch = '\n'; break;
+        case 'r': ch = '\r'; break;
+        case 't': ch = '\t'; break;
+        default: ch = next; break;  // \uXXXX and unknown: copy the marker byte
+      }
       p += 2;
     } else {
       ++p;
     }
-    if (n + 1 < outLen) out[n++] = ch;
+    // Room for the byte AND the terminator; anything more is a refusal, not a
+    // silent truncation.
+    if (n + 1 >= outLen) return 0;
+    out[n++] = ch;
   }
   if (*p != '"') return 0;
   out[n] = '\0';
@@ -404,6 +461,30 @@ uint32_t resolveRetryAfterMillis(long seconds) {
   return ms > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(ms);
 }
 
+// Compare two 64-character lowercase-hex digests in CONSTANT TIME with respect
+// to their contents (the number of differing bytes does not leak through an
+// early return). A digest comparison is a security check: a byte-at-a-time
+// early-out gives an attacker a timing oracle to recover the expected digest
+// one hex digit at a time. Both operands are fixed 64-char NUL-terminated
+// fields, so the loop is a fixed 64 iterations and `diff` accumulates every
+// position before it is tested once.
+//
+// This is defence in depth: the digest is over attacker-supplied image bytes
+// and is compared against the server-offered digest, so a timing side channel
+// here is exactly the kind of thing that should not exist. It does not (and
+// cannot) make the signature verifier constant-time — that is the crypto
+// backend's job, and the seam's contract says so.
+bool constantTimeHexEqual64(const char* a, const char* b) {
+  unsigned char diff = 0;
+  for (size_t i = 0; i < 64; ++i) {
+    diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+  }
+  // Both are exactly 64 hex chars by construction; also require the terminator
+  // to match, so a malformed shorter string can never compare equal.
+  diff |= static_cast<unsigned char>(a[64]) ^ static_cast<unsigned char>(b[64]);
+  return diff == 0;
+}
+
 }  // namespace
 
 bool InsightOta::downloadImage(const OtaOffer& offer, uint32_t* received) {
@@ -419,10 +500,14 @@ bool InsightOta::downloadImage(const OtaOffer& offer, uint32_t* received) {
   for (size_t i = 0; i < want; ++i) image_[i] = 0;  // clear the staging prefix
 
   // The transport GET seam is a whole-buffer read; the image is fetched into
-  // image_ from offset 0 with a capacity of `offer.size`, so an over-long body
-  // cannot run past what the offer promised. The delivered length is read from
-  // the seam's OUT-PARAMETER — never from a terminator, because image bytes are
-  // opaque and a 0x00 in the middle is data, not an end-of-body marker.
+  // image_ from offset 0 with a capacity of `offer.size`, so the copy itself
+  // can never run past what the offer promised. The delivered length is read
+  // from the seam's OUT-PARAMETER — never from a terminator, because image
+  // bytes are opaque and a 0x00 in the middle is data, not an end-of-body
+  // marker. `delivered` is reported VERBATIM (not clamped): a seam that claims
+  // MORE than the offer promised is a lie the caller's `received != offer.size`
+  // check must SEE and reject, not have silently smoothed to equality — clamping
+  // would turn a malformed/over-long delivery into a passing size gate.
   size_t delivered = 0;
   HttpOutcome outcome =
       transport_->get(offer.url, reinterpret_cast<char*>(image_), want,
@@ -433,10 +518,6 @@ bool InsightOta::downloadImage(const OtaOffer& offer, uint32_t* received) {
   if (outcome.kind != HttpOutcome::Ok) return false;
   if (outcome.status < 200 || outcome.status >= 300) return false;
 
-  // A response that delivers MORE than the offer promised is a size mismatch
-  // too; clamp to the promised length so `received > offer.size` is reported by
-  // the caller's equality check as a failure rather than silently accepted.
-  if (delivered > want) delivered = want;
   *received = static_cast<uint32_t>(delivered);
   return true;
 }
@@ -479,21 +560,43 @@ OtaResult InsightOta::processOffer(const char* offerJson) {
 
   // Refuse an offer that cannot be buffered whole (or is empty) BEFORE any
   // image byte is fetched. A size we cannot hold is a size we must not start.
+  //
+  // NOT retryable, and no schedule: the SAME offer would be refused the same
+  // way forever, so a caller that honoured a retry flag here would spin on a
+  // size it can never buffer (the hot loop INV-O2 forbids). `retry == false`
+  // and a zero schedule say "this offer is refused; wait for a different one".
+  // lastVerification() still carries the offered size, so the refusal is
+  // diagnosable.
   if (offer.size == 0 || offer.size > maxImage_) {
     reason_ = OtaResult::UnsupportedSize;
-    return OtaResult::make(OtaResult::UnsupportedSize, true, 0, 0, 0);
+    return OtaResult::make(OtaResult::UnsupportedSize, false, 0, 0, 0);
   }
 
   // A detached flash sink means there is nowhere safe to write; a fully
   // verified image would be dropped, so fail before downloading.
+  //
+  // Still retryable (there is nothing wrong with the OFFER — the device is
+  // merely unconfigured, and a caller that wires the sink can make the very
+  // next pass succeed), but scheduled with a bounded backoff like every other
+  // retry-worthy outcome: a genuinely misconfigured device that retries must
+  // not hot-loop (INV-O2). Previously this returned `retry == true` with a ZERO
+  // schedule, which is exactly the "retryable with no deadline" hole.
   if (flash_ == 0) {
+    const uint32_t wait = backoffMillis(0u);
+    lastRetryAfter_ = wait;
+    nextAttemptAtMillis_ = nowMillis_ + wait;
     reason_ = OtaResult::TransportFailure;
-    return OtaResult::make(OtaResult::TransportFailure, true, 0, 0, 0);
+    return OtaResult::make(OtaResult::TransportFailure, true, 0,
+                           nextAttemptAtMillis_, wait);
   }
 
   if (transport_ == 0) {
+    const uint32_t wait = backoffMillis(0u);
+    lastRetryAfter_ = wait;
+    nextAttemptAtMillis_ = nowMillis_ + wait;
     reason_ = OtaResult::TransportFailure;
-    return OtaResult::make(OtaResult::TransportFailure, true, 0, 0, 0);
+    return OtaResult::make(OtaResult::TransportFailure, true, 0,
+                           nextAttemptAtMillis_, wait);
   }
 
   uint32_t received = 0;
@@ -516,14 +619,26 @@ OtaResult InsightOta::processOffer(const char* offerJson) {
     lastRetryAfter_ = wait;
     nextAttemptAtMillis_ = nowMillis_ + wait;
     reason_ = OtaResult::TransportFailure;
+    // Record what arrived before the failure so the record is diagnosable even
+    // on a transport failure.
+    lastReceived_ = received;
     return OtaResult::make(OtaResult::TransportFailure, true, received,
                            nextAttemptAtMillis_, wait);
   }
 
   // Enforce the promised length BEFORE hashing. A short (truncated) or long
   // read is a mismatch; nothing is flashed.
+  //
+  // Retryable but NOT scheduled: a size mismatch is a property of THIS
+  // transfer (a truncated stream, or a seam that reported a length the offer
+  // did not promise), and the caller's normal loop re-attempts on the next
+  // poll. No backoff is recorded because the failure is not a 429 and is not
+  // evidence of a flapping link — and crucially the offer itself is fine. The
+  // computed digest is "": nothing was hashed. `received`/lastVerification()
+  // carry the short/long count so the divergence is visible.
   if (received != offer.size) {
     reason_ = OtaResult::SizeMismatch;
+    lastReceived_ = received;
     return OtaResult::make(OtaResult::SizeMismatch, true, received, 0, 0);
   }
 
@@ -536,19 +651,25 @@ OtaResult InsightOta::processOffer(const char* offerJson) {
   hasher_.finalize(ctx, digest);
   toHex(digest, result.computedSha256);
 
-  if (std::strcmp(result.computedSha256, offer.sha256) != 0) {
+  // Record the computed digest and the byte count REGARDLESS of whether the
+  // digest then matches, so a HashMismatch pass — the case that most needs "what
+  // did we compute?" — is diagnosable through both the OtaResult and
+  // lastVerification(). (Previously this copy happened only on the success path,
+  // so exactly the failing cases were the ones with an empty record.)
+  copyInto(lastComputedSha256_, sizeof(lastComputedSha256_),
+           result.computedSha256);
+  lastReceived_ = received;
+
+  if (!constantTimeHexEqual64(result.computedSha256, offer.sha256)) {
     // Byte count matched, digest did not (ST-O1(b): the last byte was altered).
+    // The computed digest already rides on `result`, and the record carries it
+    // too, so an operator sees offered-vs-computed for the failure.
     result.kind = OtaResult::HashMismatch;
     result.retry = true;
     result.received = received;
     reason_ = OtaResult::HashMismatch;
     return result;
   }
-
-  // Record the computed digest so lastVerification() carries it.
-  copyInto(lastComputedSha256_, sizeof(lastComputedSha256_),
-           result.computedSha256);
-  lastReceived_ = received;
 
   // --- the signed-image gate (B14 / FR-OTA-07 / NFR-SEC-03) --------------
   //
@@ -634,12 +755,33 @@ OtaResult InsightOta::processOffer(const char* offerJson) {
 
 OtaResult InsightOta::runWithOffer(const char* offerJson) {
   ++attempts_;  // the offer itself was supplied, not fetched
+
+  // Scheduling note (INV-O2): this entry point is the seam a caller (or a test)
+  // uses when IT has already decided to process this offer body, so it does not
+  // re-check `isReady()` — the 429/quota enforcement lives in the pass that
+  // FETCHES the offer (run()), the only path that can observe a server 429, and
+  // enforcing a schedule here would make the injected-offer tests untestable.
+  //
+  // It DOES guarantee it leaves no stale deadline behind: processOffer() resets
+  // `nextAttemptAtMillis_`/`lastRetryAfter_` at the top of every pass (after
+  // reading the clock), so a schedule a previous pass recorded — a 429's
+  // retry-after — can never be inherited by this one. A caller alternating
+  // isReady()/runWithOffer() is therefore never told "not ready" because of a
+  // deadline that belonged to an earlier offer. That reset is the invariant
+  // test_run_with_offer_clears_stale_schedule pins.
   return processOffer(offerJson);
 }
 
 OtaResult InsightOta::run() {
+  // Reset the pass schedule up front so a stale deadline from a previous pass
+  // can never be observed or inherited here — every branch below either records
+  // a fresh one or leaves a deliberate zero. (processOffer() resets again after
+  // reading the clock; this covers the early returns before it.)
+  nowMillis_ = readClock();
+  nextAttemptAtMillis_ = 0;
+  lastRetryAfter_ = 0;
+
   if (transport_ == 0) {
-    nowMillis_ = readClock();
     lastStatus_ = 0;
     reason_ = OtaResult::TransportFailure;
     const uint32_t wait = backoffMillis(0u);
